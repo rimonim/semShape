@@ -3,7 +3,8 @@ Compute pairwise semantic similarity quantities for token pairs from a CSV.
 
 Reads a CSV with word pairs, maps words to token ids via a vocabulary file,
 computes the requested similarity quantities, and writes the results as
-additional columns in the output CSV.
+additional columns in the output CSV.  Both plain .csv and gzip-compressed
+.csv.gz files are accepted as input and output (inferred from filename).
 
 Three modes (mutually exclusive):
   --probs   Precomputed (N, V) probability memmap from sample_gsm.py.
