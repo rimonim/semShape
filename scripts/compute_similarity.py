@@ -200,11 +200,19 @@ def main():
     t1_valid = t1_ids[valid_mask]
     t2_valid = t2_ids[valid_mask]
 
+    pairs_valid = np.stack([t1_valid, t2_valid], axis=1)
+    unique_pairs, inverse_indices = np.unique(pairs_valid, axis=0, return_inverse=True)
+    t1_unique = unique_pairs[:, 0]
+    t2_unique = unique_pairs[:, 1]
+    n_unique = len(unique_pairs)
+    if n_unique < n_valid:
+        print(f"Deduped: {n_valid:,} valid pairs → {n_unique:,} unique pairs")
+
     if args.probs is not None:
         batch_size = args.batch_size or 4096
         print(f"Mode: probs  |  {args.probs}")
         result = compute_pairwise_similarities_from_probs(
-            args.probs, t1_valid, t2_valid,
+            args.probs, t1_unique, t2_unique,
             quantities=args.quantities,
             batch_size=batch_size,
             device=device,
@@ -217,7 +225,7 @@ def main():
         W = model.lm_head.weight.detach().to(device).float()
         print(f"Model: V={model.config.vocab_size}, d={model.config.n_embd}")
         result = compute_pairwise_similarities(
-            args.h_eff, W, t1_valid, t2_valid,
+            args.h_eff, W, t1_unique, t2_unique,
             quantities=args.quantities,
             batch_size=batch_size,
             device=device,
@@ -253,7 +261,7 @@ def main():
 
         result = compute_pairwise_similarities_prob_window(
             model, data, weights_lookup,
-            t1_valid, t2_valid,
+            t1_unique, t2_unique,
             quantities=args.quantities,
             block_size=args.block_size,
             min_context=args.min_context,
@@ -265,7 +273,7 @@ def main():
 
     for qty in args.quantities:
         col = np.full(len(df), np.nan)
-        col[valid_mask] = result[qty]
+        col[valid_mask] = result[qty][inverse_indices]
         df[qty] = col
 
     os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
