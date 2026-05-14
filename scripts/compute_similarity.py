@@ -5,28 +5,33 @@ Reads a CSV with word pairs, maps words to token ids via a vocabulary file,
 computes the requested similarity quantities, and writes the results as
 additional columns in the output CSV.
 
-Two modes (mutually exclusive):
-  --h-eff   Use precomputed h_eff hidden states (no windowing, faster).
+Three modes (mutually exclusive):
+  --probs   Precomputed (N, V) probability memmap from sample_gsm.py.
+            No model needed; fastest for repeated analyses.
+  --h-eff   Precomputed h_eff hidden states (no windowing).
   --data    Stream the corpus with probability-space window averaging.
 
-Example (h_eff, no window):
-    python scripts/compute_similarity.py \\
-        --input pairs.csv \\
-        --output pairs_with_sim.csv \\
-        --ckpt out-coca/ckpt.pt \\
-        --vocab data/coca/meta.pkl \\
-        --h-eff features/coca/coca_val_h_eff.npy \\
-        --quantities expected_probability expected_surprisal kl_divergence
+Examples:
 
-Example (prob-space backward window):
-    python scripts/compute_similarity.py \\
-        --input pairs.csv \\
-        --output pairs_sim_bwd.csv \\
-        --ckpt out-coca/ckpt.pt \\
-        --vocab data/coca/meta.pkl \\
-        --data data/coca/val.bin \\
-        --window-size 100 --decay-type power --alpha 0.5 \\
-        --direction backward --no-include-target --tokens-per-minute 150
+  # From precomputed GSM samples (fastest; run sample_gsm.py first)
+  python scripts/compute_similarity.py \\
+      --input pairs.csv --output pairs_sim.csv \\
+      --vocab data/coca/meta.pkl \\
+      --probs features/coca_gsm/coca_val_no_window_probs.npy
+
+  # From h_eff (non-windowed, no corpus re-run)
+  python scripts/compute_similarity.py \\
+      --input pairs.csv --output pairs_sim.csv \\
+      --ckpt out-coca/ckpt.pt --vocab data/coca/meta.pkl \\
+      --h-eff features/coca/coca_val_h_eff.npy
+
+  # Streaming windowed corpus pass
+  python scripts/compute_similarity.py \\
+      --input pairs.csv --output pairs_sim.csv \\
+      --ckpt out-coca/ckpt.pt --vocab data/coca/meta.pkl \\
+      --data data/coca/val.bin \\
+      --window-size 100 --decay-type power --alpha 0.5 \\
+      --direction backward --tokens-per-minute 150
 """
 
 import argparse
@@ -44,6 +49,7 @@ sys.path.insert(0, PROJECT_ROOT)
 from model import GPT, GPTConfig
 from shape.similarity import (
     compute_pairwise_similarities,
+    compute_pairwise_similarities_from_probs,
     compute_pairwise_similarities_prob_window,
 )
 from shape.windowing import build_weight_lookup
@@ -63,18 +69,23 @@ def parse_args():
     p.add_argument("--word2-col", default="word2",
                    help="Column name for the target word (default: 'word2').")
 
-    # Model / vocab
-    p.add_argument("--ckpt", required=True,
-                   help="Path to GPT checkpoint .pt.")
+    # Vocab (always required)
     p.add_argument("--vocab", required=True,
                    help="Path to meta.pkl containing 'stoi' and 'itos' dicts.")
 
-    # Mode: h_eff vs. streaming corpus (mutually exclusive)
+    # Model checkpoint (required for --h-eff and --data, not for --probs)
+    p.add_argument("--ckpt", default=None,
+                   help="Path to GPT checkpoint .pt (required for --h-eff and --data).")
+
+    # Mode (mutually exclusive)
     mode = p.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--probs",
+                      help="Path to *_probs.npy from sample_gsm.py. No model needed.")
     mode.add_argument("--h-eff",
-                      help="Path to h_eff .npy file (non-windowed mode).")
+                      help="Path to h_eff .npy file (non-windowed, requires --ckpt).")
     mode.add_argument("--data",
-                      help="Path to binary token corpus .bin (windowed mode).")
+                      help="Path to binary corpus .bin for streaming windowed pass "
+                           "(requires --ckpt).")
 
     # Quantities
     p.add_argument("--quantities", nargs="+",
@@ -82,9 +93,9 @@ def parse_args():
                    choices=["expected_probability", "expected_surprisal", "kl_divergence"],
                    help="Similarity quantities to compute (default: all three).")
 
-    # Windowing (only relevant with --data)
+    # Windowing (only for --data)
     p.add_argument("--window-size", type=int, default=0,
-                   help="Half-window radius in tokens (default: 0 = single position).")
+                   help="Half-window radius in tokens (default: 0).")
     p.add_argument("--decay-type", default="none",
                    choices=["linear", "harmonic", "exponential", "power", "none"],
                    help="Window weight decay function (default: none).")
@@ -97,24 +108,22 @@ def parse_args():
                    help="Exclude d=0 from the window average.")
     p.set_defaults(include_target=True)
     p.add_argument("--tokens-per-minute", type=float, default=None,
-                   help="Convert token distances to minutes before power decay "
-                        "(d_minutes = d_tokens / tokens_per_minute).")
+                   help="Convert token distances to minutes before power decay.")
 
     # Compute
     p.add_argument("--device", default=None,
                    help="Device string (default: cuda if available, else cpu).")
     p.add_argument("--batch-size", type=int, default=None,
-                   help="Batch size: h_eff rows (non-windowed) or sequences (windowed). "
-                        "Defaults: 2048 for h_eff mode, 32 for windowed mode.")
+                   help="Batch size. Defaults: 4096 (--probs), 2048 (--h-eff), 32 (--data).")
     p.add_argument("--block-size", type=int, default=None,
-                   help="Override model block_size (windowed mode only).")
+                   help="Override model block_size (--data only).")
     p.add_argument("--min-context", type=int, default=32,
-                   help="Minimum left-context tokens (windowed mode, default 32).")
+                   help="Minimum left-context tokens (--data only, default 32).")
     p.add_argument("--compute-dtype", default="bfloat16",
                    choices=["bfloat16", "float16", "float32"],
-                   help="Autocast dtype for windowed mode (default: bfloat16).")
+                   help="Autocast dtype for --data mode (default: bfloat16).")
 
-    return p.parse_args()
+    return p, p.parse_args()
 
 
 def load_model(ckpt_path, device):
@@ -137,7 +146,6 @@ def load_vocab(vocab_path):
 
 
 def words_to_ids(words, stoi):
-    """Map words to token ids. Returns (ids, oov_mask). OOV entries get id -1."""
     ids = np.full(len(words), -1, dtype=np.int64)
     oov_mask = np.ones(len(words), dtype=bool)
     for i, w in enumerate(words):
@@ -148,12 +156,14 @@ def words_to_ids(words, stoi):
 
 
 def main():
-    args = parse_args()
+    p, args = parse_args()
+
+    if args.probs is None and args.ckpt is None:
+        p.error("--ckpt is required for --h-eff and --data modes.")
 
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
     print(f"device: {device}")
 
-    # Load input CSV
     df = pd.read_csv(args.input)
     for col in (args.word1_col, args.word2_col):
         if col not in df.columns:
@@ -161,7 +171,6 @@ def main():
                              f"Available: {list(df.columns)}")
     print(f"Loaded {len(df):,} rows from {args.input!r}.")
 
-    # Load vocab and map words to ids
     stoi = load_vocab(args.vocab)
     words1 = df[args.word1_col].astype(str).tolist()
     words2 = df[args.word2_col].astype(str).tolist()
@@ -190,16 +199,22 @@ def main():
     t1_valid = t1_ids[valid_mask]
     t2_valid = t2_ids[valid_mask]
 
-    # Load model
-    model = load_model(args.ckpt, device)
-    V = model.config.vocab_size
-    print(f"Model: V={V}, d={model.config.n_embd}, block_size={model.config.block_size}")
+    if args.probs is not None:
+        batch_size = args.batch_size or 4096
+        print(f"Mode: probs  |  {args.probs}")
+        result = compute_pairwise_similarities_from_probs(
+            args.probs, t1_valid, t2_valid,
+            quantities=args.quantities,
+            batch_size=batch_size,
+            device=device,
+            verbose=True,
+        )
 
-    # Compute similarities
-    if args.h_eff is not None:
-        # Non-windowed mode: use precomputed h_eff
+    elif args.h_eff is not None:
         batch_size = args.batch_size or 2048
+        model = load_model(args.ckpt, device)
         W = model.lm_head.weight.detach().to(device).float()
+        print(f"Model: V={model.config.vocab_size}, d={model.config.n_embd}")
         result = compute_pairwise_similarities(
             args.h_eff, W, t1_valid, t2_valid,
             quantities=args.quantities,
@@ -207,14 +222,16 @@ def main():
             device=device,
             verbose=True,
         )
+
     else:
-        # Windowed mode: streaming corpus pass
         batch_size = args.batch_size or 32
         if args.batch_size is None:
-            print("Note: windowed mode uses batch_size=32 (set --batch-size to override).")
+            print("Note: --data mode uses batch_size=32 (set --batch-size to override).")
+        model = load_model(args.ckpt, device)
+        print(f"Model: V={model.config.vocab_size}, d={model.config.n_embd}")
 
-        if args.window_size > 0:
-            weights_lookup = build_weight_lookup(
+        weights_lookup = (
+            build_weight_lookup(
                 window_size=args.window_size,
                 decay_type=args.decay_type,
                 alpha=args.alpha,
@@ -222,8 +239,9 @@ def main():
                 include_target=args.include_target,
                 tokens_per_minute=args.tokens_per_minute,
             )
-        else:
-            weights_lookup = {0: 1.0}
+            if args.window_size > 0
+            else {0: 1.0}
+        )
 
         data = np.memmap(args.data, dtype=np.uint16, mode="r")
         print(f"Corpus: {len(data):,} tokens")
@@ -244,7 +262,6 @@ def main():
             verbose=True,
         )
 
-    # Assemble output
     for qty in args.quantities:
         col = np.full(len(df), np.nan)
         col[valid_mask] = result[qty]
@@ -256,8 +273,7 @@ def main():
     print(f"Columns added: {args.quantities}")
     for qty in args.quantities:
         vals = result[qty]
-        print(f"  {qty}: min={vals.min():.4f}, max={vals.max():.4f}, "
-              f"mean={vals.mean():.4f}")
+        print(f"  {qty}: min={vals.min():.4f}, max={vals.max():.4f}, mean={vals.mean():.4f}")
 
 
 if __name__ == "__main__":
