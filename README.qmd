@@ -51,8 +51,6 @@ The semShape framework opens the door to many interesting constructs derived fro
 
 semShape also opens the door to new methodologies investigating the shape of the global semantic manifold: To what extent is this shape stable across languages? How does the shape change in the wake of conceptual restructuring of the language community (e.g. a theoretical paradigm shift in a scientific field)? Is it easier to learn novel words with distributional meanings that fall on the manifold than words with meanings that fall off it?
 
-For more details and the beginnings of an empirical investigation using this framework, see the working paper in `projects/paper/`.
-
 ## Repo Layout
 
 ```
@@ -65,15 +63,13 @@ models/<dataset>/      Stage-2 normalizing-flow checkpoints
 embeddings/            Stage-3 static-embedding .npz files
 train.py, model.py     LLM training (nanoGPT with rotary / RMSNorm / SwiGLU)
 manim/                 explanatory visualization
-projects/              subprojects (each is its own git repo, gitignored here)
-  paper/               working paper, notebooks, training configs, and data
 ```
 
 `train.py` and `model.py` are a lightly modernized nanoGPT [@karpathy2025]; the project's contributions are in [shape/](shape/) and the scripts that drive it.
 
 ## Pipeline and API
 
-1.  **LLM Training**: `projects/paper/data/<dataset>/` → `train.py` → `out-\<dataset\>/ckpt.pt`
+1.  **LLM Training**: `path/to/<dataset>/` → `train.py` → `out-\<dataset\>/ckpt.pt`
 2.  **Corpus Run**: `shape.extract.extract_features` → `features/<dataset>/` (per-position $h$ or $h_⊥$)
 3.  **Visualization**: `shape.viz` → density plots
 4.  **Static Embeddings**: `shape.embeddings.compute_embeddings` → `embeddings/<dataset>/` (static embeddings analogous to word2vec) → `shape.embeddings_benchmarks`
@@ -85,12 +81,16 @@ CLI entry points (each is a thin wrapper around the corresponding `shape/` funct
 
 ``` bash
 python scripts/extract_features.py  --ckpt out-coca/ckpt.pt \
-                                    --data projects/paper/data/coca/test.bin \
+                                    --data path/to/coca/test.bin \
                                     --out-dir features/coca --dataset coca_test
 python scripts/fit_density.py       --h-eff features/coca/coca_test_h_eff.npy \
                                     --out models/coca/coca_test_flow.pt
 python scripts/compute_embeddings.py --ckpt out-coca/ckpt.pt --features-dir features/coca \
                                     --dataset coca_test --out embeddings/coca_test_emb.npz
+python scripts/compute_similarity.py --ckpt out-coca/ckpt.pt \
+                                    --vocab path/to/coca/meta.pkl \
+                                    --h-eff features/coca/coca_test_h_eff.npy \
+                                    --input pairs.csv --output pairs_with_sim.csv
 ```
 
 The `scripts/discrete_*.py` pair (`discrete_build_fcm.py`, `discrete_full_predictions.py`) implements the count-based FCM+PMI baseline against which the continuous pipeline can be compared.
@@ -100,32 +100,18 @@ The `scripts/discrete_*.py` pair (`discrete_build_fcm.py`, `discrete_full_predic
 | Module | Role |
 |------------------------------------|------------------------------------|
 | [`geometry.py`](shape/geometry.py) | ILR basis (Helmert SBP), `ILR_apply` / `ILR_apply_T`, `compute_A` (= ΨW), `degenerate_direction`, `project_h`. All cumsum-based — never materializes the (V−1)×V basis. |
-| [`windowing.py`](shape/windowing.py) | Decay-weight tables for context-window averaging (linear / harmonic / exponential / power), shared with the discrete FCM pipeline. |
+| [`windowing.py`](shape/windowing.py) | Decay-weight tables for context-window averaging (linear / harmonic / exponential / power), shared with the discrete FCM pipeline. Supports a `tokens_per_minute` parameter for converting token distances to elapsed time before applying power-law decay. |
 | [`extract.py`](shape/extract.py) | Stage 1. Streams the corpus through the LLM, emits per-position $h$ (or optionally $h_⊥$, with the $W^T\textbf{1}$ degenerate direction projected out) and the marginal $Z_w$. Supports memmapped output and reservoir subsampling for COCA-scale runs. |
 | [`density.py`](shape/density.py) | Stage 2. Fits a Zuko Neural Spline Flow on standardized $h$ or $h_⊥$ for $g̃(h)$; provides `log_density` and `sample`. |
 | [`embeddings.py`](shape/embeddings.py) | Stage 3. Moment matrix $M[t,w] = E[p_t·p_w] → PMI → optional\ Ψ → SVD → (V, k)$ embedding; plus `nearest_neighbors`. |
 | [`embeddings_benchmarks.py`](shape/embeddings_benchmarks.py) | Psycholinguistic benchmark evaluation for static word embeddings. |
 | [`viz.py`](shape/viz.py) | Token-conditional density plots. Three bases: token-specific weighted PCA, global PCA, and user-specified token-pair contrasts (axes = log-odds of one token vs. another). Two views: model (importance-weighted) and empirical (filtered by next-token id). |
+| [`similarity.py`](shape/similarity.py) | Pairwise probability-theoretic similarity between token pairs: expected probability $E[p_{t_2} \mid t_1]$, expected surprisal $-E[\log p_{t_2} \mid t_1]$, and KL divergence $D_{KL}(g(\cdot\mid t_1)\Vert g(\cdot\mid t_2))$. All quantities are importance-weighted expectations; two entry points cover the h_eff-based (no windowing) and streaming prob-space-windowed corpus passes. |
 | [`distinctiveness.py`](shape/distinctiveness.py) | Measures the distinctiveness of tokens in the embedding space. |
 | [`polysemy.py`](shape/polysemy.py) | Analyzes the polysemy of tokens in the embedding space using mixture models. |
 
 ### Working with Cached Features
 
 `shape.extract.valid_positions(meta)` maps memmap rows to corpus indices. `shape.viz` builds a working subsample with cached `log_Z_of_h` so that $p_w(h_i)$ is an O(d) query per token, which is what makes interactive polysemy plotting tractable.
-
-## Quickstart on the Toy Corpus
-
-``` bash
-python projects/paper/data/shakespeare_char/prepare.py
-python train.py projects/paper/config/train_shakespeare_char.py
-python scripts/extract_features.py  --ckpt out-shakespeare-char/ckpt.pt \
-       --data projects/paper/data/shakespeare_char/val.bin \
-       --out-dir features/shakespeare_char --dataset shakespeare_char
-python scripts/compute_embeddings.py --ckpt out-shakespeare-char/ckpt.pt \
-       --features-dir features/shakespeare_char --dataset shakespeare_char \
-       --out embeddings/shakespeare_char_emb.npz --k 32 --neighbors-for "the and a"
-```
-
-Then open `projects/paper/notebooks/shakespeare_char_polysemy.ipynb` for a walk-through of the density and visualization layers on the same features. The COCA-scale counterpart is `projects/paper/notebooks/coca_polysemy.ipynb`.
 
 # References

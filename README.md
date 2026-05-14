@@ -19,7 +19,7 @@ averages. The framework analyses this density and the per-token
 reweightings $g(y|t) ∝ p_t(y) · g(y)$ derived from it. This is
 interesting for a few reasons:
 
-### A Continuous Generalization of Word Embeddings
+### Word Embeddings as Summaries of a Continuous Distribution
 
 word2vec, GloVe, and other similar word embedding methods are all, in
 essence, low-rank factorizations of a (shifted) PMI matrix whose entries
@@ -40,15 +40,14 @@ values; see Levy et al. (2015)\] are rendered unnecessary. SVD on the
 resulting PMI matrix recovers static word embeddings of the same flavor
 as word2vec, but with much cleaner theoretical interpretation.
 
-The ILR (isometric log-ratio) transform enters here for a principled
-reason. Since probability distributions are constrained to sum to 1, the
+Since probability distributions are constrained to sum to 1, the
 meaningful notion of distance between two probability distributions is a
-function of their *log-ratios*, not their absolute differences. ILR is
-exactly the orthonormal basis that puts log-ratios into ordinary
-Euclidean coordinates. In other words, linear directions in ILR-space
-correspond to the log odds of observing one token (or group of tokens)
-over another in a given context, with zero corresponding to equal
-probability. This means that semShape embeddings can be easily
+function of their *log-ratios*, not their absolute differences. ILR
+(isometric log-ratio) is an orthonormal basis that puts log-ratios into
+ordinary Euclidean coordinates. In other words, linear directions in
+ILR-space correspond to the log odds of observing one token (or group of
+tokens) over another in a given context, with zero corresponding to
+equal probability. This means that semShape embeddings can be easily
 visualized using intuitively interpretable axes, like this:
 
 ![](assets/viz_cook_make_build.png)
@@ -56,8 +55,8 @@ visualized using intuitively interpretable axes, like this:
 Once again, these embeddings live in a space that is nearly analogous to
 that of classic word embeddings like word2vec and GloVe. This is because
 both shifted PMI (the classic word embeddings approach) and ILR are
-log-ratios. In fact, under the ILR basis Ψ, a row of the PMI matrix can
-be expressed simply as a difference in ILR-space means:
+log-ratios. In fact, under the ILR basis $Ψ$, a row of the PMI matrix
+can be expressed simply as a difference in ILR-space means:
 $Ψ · PMI_t = E[Y | t] − E[Y]$ where $Y = ILR(softmax-output)$.
 
 An added bonus of distilling log-ratio embeddings from an LLM is that
@@ -81,8 +80,8 @@ g(y | t) = Σ_k π_{t,k} · g_k(y | t)$$
 Each component $g_k$ is a sense; $π_{t,k}$ is its relative frequency;
 $ν_{t,k} = E_{g_k}[Y]$ is a sense-specific embedding. A standard
 word2vec embedding $μ_t = E[Y | t] = Σ_k π_{t,k} · ν_{t,k}$ is, in this
-view, literally a mixture-average of sense embeddings. Polysemy analysis
-amounts to unmixing what averaging collapsed.
+view, a mixture-average of sense embeddings. Polysemy analysis amounts
+to unmixing what averaging collapsed.
 
 The covariance of $Y | t$ then decomposes (law of total variance) into
 two geometrically distinct contributions to the overall spread of a
@@ -128,22 +127,15 @@ paradigm shift in a scientific field)? Is it easier to learn novel words
 with distributional meanings that fall on the manifold than words with
 meanings that fall off it?
 
-For more details and the beginnings of an empirical investigation using
-this framework, see [working_paper.qmd](working_paper.qmd).
-
 ## Repo Layout
 
     shape/                 the framework — see API below
     scripts/               CLI wrappers around shape/ for each pipeline stage
-    notebooks/             analysis notebooks
     tests/                 pytest suite for shape/
-    config/                LLM training configs (nanoGPT-style) per dataset
-    data/                  tokenized corpora (.bin); see data/<dataset>/prepare.py
     out-<dataset>/         training checkpoints (ckpt.pt + meta.pkl)
     features/<dataset>/    Stage-1 outputs (h_eff, Z, meta)
     models/<dataset>/      Stage-2 normalizing-flow checkpoints
     embeddings/            Stage-3 static-embedding .npz files
-    working_paper.qmd      theoretical writeup
     train.py, model.py     LLM training (nanoGPT with rotary / RMSNorm / SwiGLU)
     manim/                 explanatory visualization
 
@@ -153,15 +145,14 @@ scripts that drive it.
 
 ## Pipeline and API
 
-1.  **LLM Training**: `data/<dataset>/` → `train.py` →
+1.  **LLM Training**: `path/to/<dataset>/` → `train.py` →
     `out-\<dataset\>/ckpt.pt`
 2.  **Corpus Run**: `shape.extract.extract_features` →
     `features/<dataset>/` (per-position $h$ or $h_⊥$)
 3.  **Visualization**: `shape.viz` → density plots
 4.  **Static Embeddings**: `shape.embeddings.compute_embeddings` →
     `embeddings/<dataset>/` (static embeddings analogous to word2vec) →
-    `shape.embeddings_benchmarks`. *(Reproducing the word2vec
-    baselines in Studies 1–2 requires `gensim`.)*
+    `shape.embeddings_benchmarks`
 5.  **Global Density Estimation**: `shape.density.fit_flow` →
     `models/<dataset>/` (Neural Spline Flow fit on $h$ or $h_⊥$)
 6.  **Distinctiveness Analysis**:
@@ -174,12 +165,17 @@ CLI entry points (each is a thin wrapper around the corresponding
 `shape/` function — see `--help` on any of them):
 
 ``` bash
-python scripts/extract_features.py  --ckpt out-coca/ckpt.pt --data data/coca/test.bin \
+python scripts/extract_features.py  --ckpt out-coca/ckpt.pt \
+                                    --data path/to/coca/test.bin \
                                     --out-dir features/coca --dataset coca_test
 python scripts/fit_density.py       --h-eff features/coca/coca_test_h_eff.npy \
                                     --out models/coca/coca_test_flow.pt
 python scripts/compute_embeddings.py --ckpt out-coca/ckpt.pt --features-dir features/coca \
                                     --dataset coca_test --out embeddings/coca_test_emb.npz
+python scripts/compute_similarity.py --ckpt out-coca/ckpt.pt \
+                                    --vocab path/to/coca/meta.pkl \
+                                    --h-eff features/coca/coca_test_h_eff.npy \
+                                    --input pairs.csv --output pairs_with_sim.csv
 ```
 
 The `scripts/discrete_*.py` pair (`discrete_build_fcm.py`,
@@ -191,12 +187,13 @@ baseline against which the continuous pipeline can be compared.
 | Module | Role |
 |----|----|
 | [`geometry.py`](shape/geometry.py) | ILR basis (Helmert SBP), `ILR_apply` / `ILR_apply_T`, `compute_A` (= ΨW), `degenerate_direction`, `project_h`. All cumsum-based — never materializes the (V−1)×V basis. |
-| [`windowing.py`](shape/windowing.py) | Decay-weight tables for context-window averaging (linear / harmonic / exponential / power), shared with the discrete FCM pipeline. |
+| [`windowing.py`](shape/windowing.py) | Decay-weight tables for context-window averaging (linear / harmonic / exponential / power), shared with the discrete FCM pipeline. Supports a `tokens_per_minute` parameter for converting token distances to elapsed time before applying power-law decay. |
 | [`extract.py`](shape/extract.py) | Stage 1. Streams the corpus through the LLM, emits per-position $h$ (or optionally $h_⊥$, with the $W^T\textbf{1}$ degenerate direction projected out) and the marginal $Z_w$. Supports memmapped output and reservoir subsampling for COCA-scale runs. |
 | [`density.py`](shape/density.py) | Stage 2. Fits a Zuko Neural Spline Flow on standardized $h$ or $h_⊥$ for $g̃(h)$; provides `log_density` and `sample`. |
 | [`embeddings.py`](shape/embeddings.py) | Stage 3. Moment matrix $M[t,w] = E[p_t·p_w] → PMI → optional\ Ψ → SVD → (V, k)$ embedding; plus `nearest_neighbors`. |
 | [`embeddings_benchmarks.py`](shape/embeddings_benchmarks.py) | Psycholinguistic benchmark evaluation for static word embeddings. |
 | [`viz.py`](shape/viz.py) | Token-conditional density plots. Three bases: token-specific weighted PCA, global PCA, and user-specified token-pair contrasts (axes = log-odds of one token vs. another). Two views: model (importance-weighted) and empirical (filtered by next-token id). |
+| [`similarity.py`](shape/similarity.py) | Pairwise probability-theoretic similarity between token pairs: expected probability $E[p_{t_2} \mid t_1]$, expected surprisal $-E[\log p_{t_2} \mid t_1]$, and KL divergence $D_{KL}(g(\cdot\mid t_1)\Vert g(\cdot\mid t_2))$. All quantities are importance-weighted expectations; two entry points cover the h_eff-based (no windowing) and streaming prob-space-windowed corpus passes. |
 | [`distinctiveness.py`](shape/distinctiveness.py) | Measures the distinctiveness of tokens in the embedding space. |
 | [`polysemy.py`](shape/polysemy.py) | Analyzes the polysemy of tokens in the embedding space using mixture models. |
 
@@ -206,25 +203,6 @@ baseline against which the continuous pipeline can be compared.
 indices. `shape.viz` builds a working subsample with cached `log_Z_of_h`
 so that $p_w(h_i)$ is an O(d) query per token, which is what makes
 interactive polysemy plotting tractable.
-
-## Quickstart on the Toy Corpus
-
-``` bash
-python data/shakespeare_char/prepare.py
-python train.py config/train_shakespeare_char.py
-python scripts/extract_features.py  --ckpt out-shakespeare-char/ckpt.pt \
-       --data data/shakespeare_char/val.bin --out-dir features/shakespeare_char \
-       --dataset shakespeare_char
-python scripts/compute_embeddings.py --ckpt out-shakespeare-char/ckpt.pt \
-       --features-dir features/shakespeare_char --dataset shakespeare_char \
-       --out embeddings/shakespeare_char_emb.npz --k 32 --neighbors-for "the and a"
-```
-
-Then open
-[notebooks/shakespeare_char_polysemy.ipynb](notebooks/shakespeare_char_polysemy.ipynb)
-for a walk-through of the density and visualization layers on the same
-features. The COCA-scale counterpart is
-[notebooks/coca_polysemy.ipynb](notebooks/coca_polysemy.ipynb).
 
 # References
 
