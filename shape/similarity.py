@@ -11,11 +11,13 @@ All use importance-weighted sampling from the corpus:
 
     E_{Y|t1}[f(Y)] ≈ Σ_i p_{t1}(Y_i) f(Y_i) / Σ_i p_{t1}(Y_i)
 
-Two modes:
+Three modes:
 
     compute_pairwise_similarities           — h_eff-based (no windowing)
     compute_pairwise_similarities_prob_window — live corpus pass with
         probability-space window averaging (X_bar_i = Σ_d α_d X_{i+d} / Σ α_d)
+    compute_pairwise_similarities_from_probs  — precomputed (N, V) probability
+        memmap (e.g. from sample_gsm.py); avoids re-running the corpus pass
 """
 
 from contextlib import nullcontext
@@ -300,4 +302,77 @@ def compute_pairwise_similarities_prob_window(
                     pbar.set_postfix({'positions': cursor})
 
     assert cursor == n_valid_total, f"cursor {cursor} != n_valid_total {n_valid_total}"
+    return _normalize_and_collect(ep_acc, es_acc, kl_acc, Z_acc, t1_idx, quantities)
+
+
+def compute_pairwise_similarities_from_probs(
+    probs,
+    t1_ids,
+    t2_ids,
+    *,
+    quantities=('expected_probability', 'expected_surprisal', 'kl_divergence'),
+    batch_size=4096,
+    device='cuda',
+    verbose=True,
+):
+    """
+    Compute pairwise similarity quantities from a precomputed probability memmap.
+
+    Takes a (N, V) array of probability vectors (e.g. produced by sample_gsm.py)
+    and applies the same importance-weighted estimator as the other two entry
+    points. Avoids re-running the model or the corpus pass.
+
+    Args:
+        probs: path to a .npy memmap of shape (N, V) and dtype float16 or
+            float32, or an (N, V) ndarray directly.
+        t1_ids: (P,) array-like of token ids for the query token.
+        t2_ids: (P,) array-like of token ids for the target token.
+        quantities: iterable of strings from
+            {'expected_probability', 'expected_surprisal', 'kl_divergence'}.
+        batch_size: rows of probs per device batch.
+        device: torch device string.
+        verbose: show tqdm progress bar.
+
+    Returns:
+        dict mapping each requested quantity name to a float64 ndarray of
+        shape (P,).
+    """
+    quantities = set(quantities)
+    unknown = quantities - _VALID_QUANTITIES
+    if unknown:
+        raise ValueError(f"Unknown quantities: {unknown}")
+
+    t1_ids = np.asarray(t1_ids, dtype=np.int64)
+    t2_ids = np.asarray(t2_ids, dtype=np.int64)
+    assert t1_ids.shape == t2_ids.shape and t1_ids.ndim == 1
+    P = len(t1_ids)
+
+    if isinstance(probs, (str, bytes)):
+        probs_arr = np.load(probs, mmap_mode='r')
+    else:
+        probs_arr = probs
+    assert probs_arr.ndim == 2, f"probs must be 2D, got shape {probs_arr.shape}"
+    N, V = probs_arr.shape
+
+    t1_idx = torch.from_numpy(t1_ids).to(device)
+    t2_idx = torch.from_numpy(t2_ids).to(device)
+    unique_t1_idx = t1_idx.unique()
+
+    ep_acc = torch.zeros(P, dtype=torch.float64, device=device)
+    es_acc = torch.zeros(P, dtype=torch.float64, device=device)
+    kl_acc = torch.zeros(P, dtype=torch.float64, device=device)
+    Z_acc  = torch.zeros(V, dtype=torch.float64, device=device)
+
+    n_batches = (N + batch_size - 1) // batch_size
+    pbar = tqdm(range(0, N, batch_size), total=n_batches,
+                desc="sim-from-probs", disable=not verbose, unit="batch")
+    with torch.no_grad():
+        for s in pbar:
+            e = min(s + batch_size, N)
+            X_np = np.ascontiguousarray(probs_arr[s:e]).astype(np.float32, copy=False)
+            X = torch.from_numpy(X_np).to(device=device, non_blocking=True)
+            _accumulate_pair_quantities(
+                X, t1_idx, t2_idx, unique_t1_idx,
+                ep_acc, es_acc, kl_acc, Z_acc, quantities)
+
     return _normalize_and_collect(ep_acc, es_acc, kl_acc, Z_acc, t1_idx, quantities)

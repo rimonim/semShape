@@ -8,6 +8,7 @@ from shape.distinctiveness import (
 from shape.similarity import (
     compute_pairwise_similarities,
     compute_pairwise_similarities_prob_window,
+    compute_pairwise_similarities_from_probs,
 )
 
 __all__ = [
@@ -16,4 +17,5 @@ __all__ = [
     'expected_distinctiveness_all',
     'compute_pairwise_similarities',
     'compute_pairwise_similarities_prob_window',
+    'compute_pairwise_similarities_from_probs',
 ]
