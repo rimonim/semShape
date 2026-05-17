@@ -75,15 +75,20 @@ def _accumulate_pair_quantities(X, t1_idx, t2_idx, unique_t1_idx,
             kl_acc.add_((X1 * (log_X1 - log_X2)).to(torch.float64).sum(dim=0))
 
 
-def _normalize_and_collect(ep_acc, es_acc, kl_acc, Z_acc, t1_ids_tensor, quantities):
-    Z_for_pairs = Z_acc[t1_ids_tensor].clamp(min=_LOG_EPS)
+def _normalize_and_collect(ep_acc, es_acc, kl_acc, Z_acc, t1_ids_tensor, t2_ids_tensor,
+                           quantities):
+    Z_t1 = Z_acc[t1_ids_tensor].clamp(min=_LOG_EPS)
     result = {}
     if 'expected_probability' in quantities:
-        result['expected_probability'] = (ep_acc / Z_for_pairs).cpu().numpy()
+        result['expected_probability'] = (ep_acc / Z_t1).cpu().numpy()
     if 'expected_surprisal' in quantities:
-        result['expected_surprisal'] = (es_acc / Z_for_pairs).cpu().numpy()
+        result['expected_surprisal'] = (es_acc / Z_t1).cpu().numpy()
     if 'kl_divergence' in quantities:
-        result['kl_divergence'] = (kl_acc / Z_for_pairs).cpu().numpy()
+        # E_{Y|t1}[log p(t1|Y)/p(t2|Y)] estimates KL(p_{t1}||p_{t2}) only up to a
+        # base-rate correction: KL = estimate + log(Z[t2]/Z[t1]).
+        Z_t2 = Z_acc[t2_ids_tensor].clamp(min=_LOG_EPS)
+        kl = kl_acc / Z_t1 + (torch.log(Z_t2) - torch.log(Z_t1))
+        result['kl_divergence'] = kl.cpu().numpy()
     return result
 
 
@@ -156,7 +161,7 @@ def compute_pairwise_similarities(
                 X, t1_idx, t2_idx, unique_t1_idx,
                 ep_acc, es_acc, kl_acc, Z_acc, quantities)
 
-    return _normalize_and_collect(ep_acc, es_acc, kl_acc, Z_acc, t1_idx, quantities)
+    return _normalize_and_collect(ep_acc, es_acc, kl_acc, Z_acc, t1_idx, t2_idx, quantities)
 
 
 def compute_pairwise_similarities_prob_window(
@@ -302,7 +307,7 @@ def compute_pairwise_similarities_prob_window(
                     pbar.set_postfix({'positions': cursor})
 
     assert cursor == n_valid_total, f"cursor {cursor} != n_valid_total {n_valid_total}"
-    return _normalize_and_collect(ep_acc, es_acc, kl_acc, Z_acc, t1_idx, quantities)
+    return _normalize_and_collect(ep_acc, es_acc, kl_acc, Z_acc, t1_idx, t2_idx, quantities)
 
 
 def compute_pairwise_similarities_from_probs(
@@ -375,4 +380,98 @@ def compute_pairwise_similarities_from_probs(
                 X, t1_idx, t2_idx, unique_t1_idx,
                 ep_acc, es_acc, kl_acc, Z_acc, quantities)
 
-    return _normalize_and_collect(ep_acc, es_acc, kl_acc, Z_acc, t1_idx, quantities)
+    return _normalize_and_collect(ep_acc, es_acc, kl_acc, Z_acc, t1_idx, t2_idx, quantities)
+
+
+def compute_token_marginals_from_probs(
+    probs,
+    *,
+    batch_size=4096,
+    device='cuda',
+    verbose=True,
+):
+    """
+    Compute per-token marginal probability sums Z[t] = Σ_i p(t|Y_i) from a
+    precomputed (N, V) probability memmap.
+
+    Z is proportional to the corpus marginal probability of each token and is
+    the denominator used by the importance-weighted estimator.  Saving Z
+    separately lets you apply the base-rate correction
+        KL(p_{t1} || p_{t2}) = raw_estimate + log(Z[t2] / Z[t1])
+    to previously computed similarity outputs without rerunning the corpus pass.
+
+    Args:
+        probs: path to a .npy memmap of shape (N, V) and dtype float16 or
+            float32, or an (N, V) ndarray directly.
+        batch_size: rows of probs per device batch.
+        device: torch device string.
+        verbose: show tqdm progress bar.
+
+    Returns:
+        (V,) float64 ndarray of per-token marginal sums.
+    """
+    if isinstance(probs, (str, bytes)):
+        probs_arr = np.load(probs, mmap_mode='r')
+    else:
+        probs_arr = probs
+    assert probs_arr.ndim == 2, f"probs must be 2D, got shape {probs_arr.shape}"
+    N, V = probs_arr.shape
+
+    Z_acc = torch.zeros(V, dtype=torch.float64, device=device)
+
+    n_batches = (N + batch_size - 1) // batch_size
+    pbar = tqdm(range(0, N, batch_size), total=n_batches,
+                desc="marginals", disable=not verbose, unit="batch")
+    with torch.no_grad():
+        for s in pbar:
+            e = min(s + batch_size, N)
+            X_np = np.ascontiguousarray(probs_arr[s:e]).astype(np.float32, copy=False)
+            X = torch.from_numpy(X_np).to(device=device, non_blocking=True)
+            Z_acc.add_(X.to(torch.float64).sum(dim=0))
+
+    return Z_acc.cpu().numpy()
+
+
+def compute_token_marginals_from_h_eff(
+    h_eff,
+    W,
+    *,
+    batch_size=2048,
+    device='cuda',
+    verbose=True,
+):
+    """
+    Compute per-token marginal probability sums Z[t] = Σ_i softmax(W h_i)[t]
+    from precomputed h_eff hidden states.
+
+    Equivalent to compute_token_marginals_from_probs but operates on hidden
+    states rather than a precomputed probability memmap.
+
+    Args:
+        h_eff: path to .npy memmap or (N, d) ndarray of hidden states.
+        W: (V, d) tensor — model.lm_head.weight.
+        batch_size: rows of h_eff per device batch.
+        device: torch device string.
+        verbose: show tqdm progress bar.
+
+    Returns:
+        (V,) float64 ndarray of per-token marginal sums.
+    """
+    h_arr, N, _ = _open_h_eff(h_eff)
+    W_t = W.detach().to(device=device, dtype=torch.float32)
+    V = W_t.shape[0]
+
+    Z_acc = torch.zeros(V, dtype=torch.float64, device=device)
+
+    n_batches = (N + batch_size - 1) // batch_size
+    pbar = tqdm(range(0, N, batch_size), total=n_batches,
+                desc="marginals", disable=not verbose, unit="batch")
+    with torch.no_grad():
+        for s in pbar:
+            e = min(s + batch_size, N)
+            h_np = np.ascontiguousarray(h_arr[s:e]).astype(np.float32, copy=False)
+            h = torch.from_numpy(h_np).to(device=device, non_blocking=True)
+            X = torch.softmax((h @ W_t.T).float(), dim=-1)
+            Z_acc.add_(X.to(torch.float64).sum(dim=0))
+
+    return Z_acc.cpu().numpy()
