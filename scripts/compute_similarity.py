@@ -36,6 +36,7 @@ Examples:
 """
 
 import argparse
+import gc
 import os
 import pickle
 import sys
@@ -283,6 +284,16 @@ def main():
     for qty in args.quantities:
         vals = result[qty]
         print(f"  {qty}: min={vals.min():.4f}, max={vals.max():.4f}, mean={vals.mean():.4f}")
+    
+    # Explicit cleanup for GPU memory
+    del result, df
+    if 'model' in locals():
+        del model
+    if 'W' in locals():
+        del W
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
 
 if __name__ == "__main__":
