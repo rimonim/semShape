@@ -14,14 +14,18 @@ Two modes (mutually exclusive):
 
 Examples:
 
-  python scripts/compute_marginals.py \\
-      --probs features/coca_gsm/coca_val_no_window_probs.npy \\
-      --output features/coca_gsm/coca_val_marginals.npy
+    python scripts/compute_marginals.py \\
+        --probs features/coca_gsm/coca_val_short_forward_probs.npy \\
+        --output features/coca_gsm/marginals_short_forward.npy
 
-  python scripts/compute_marginals.py \\
-      --h-eff features/coca/coca_val_h_eff.npy \\
-      --ckpt out-coca/ckpt.pt \\
-      --output features/coca/coca_val_marginals.npy
+    python scripts/compute_marginals.py \\
+        --probs features/coca_gsm/coca_val_long_backward_probs.npy \\
+        --output features/coca_gsm/marginals_long_backward.npy
+
+    python scripts/compute_marginals.py \\
+        --h-eff features/coca_gsm/coca_val_no_window_h_eff.npy \\
+        --ckpt out-coca/ckpt.pt \\
+        --output features/coca_gsm/marginals_no_window.npy
 """
 
 import argparse
