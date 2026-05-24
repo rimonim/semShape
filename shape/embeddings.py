@@ -317,12 +317,12 @@ def aitchison_token_embeddings(
         h_bar   = (1/N) Σ_i h_i                                    # (d,)
         A       = Ψ W                                              # (V-1, d)
 
-    Returns embedding of shape (V, V-1):
-        origin='aitchison' → e_t = A · (h_bar_t - h_bar)   (PMI⊥_Aitchison)
-        origin='ilr'       → e_t = A · h_bar_t             (ILR_Aitchison)
+    Returns embedding of shape (V, d):
+        origin='aitchison' → e_t = h_bar_t - h_bar   (PMI⊥_Aitchison)
+        origin='ilr'       → e_t = h_bar_t           (ILR_Aitchison)
 
-    The embedding has rank ≤ d; we keep the (V, V-1) form for compatibility
-    with run_benchmarks. No SVD is applied (per-paper guidance).
+    The embedding is naturally d-dimensional (= model hidden size, typically
+    1024) because h_eff lives in ℝ^d.  No SVD is required.
 
     Args:
         h_eff: path to .npy memmap or (N, d) ndarray of hidden states.
@@ -375,7 +375,7 @@ def aitchison_token_embeddings(
     else:
         delta = h_bar_t
 
-    embedding = (delta @ A.T).to(torch.float32).cpu().numpy()  # (V, V-1)
+    embedding = delta.to(torch.float32).cpu().numpy()  # (V, d)
 
     if target_tokens is not None:
         target_tokens = np.asarray(target_tokens, dtype=np.int64)
@@ -506,9 +506,9 @@ def aitchison_token_embeddings_dt(
         h_bar_t^D = (Σ_i max(0, D_t(h_i)) · h_i) / Σ_i max(0, D_t(h_i))
         A = Ψ W   (V-1, d)
 
-    Returns embedding of shape (V, V-1):
-        origin='ilr'       → e_t = A · h_bar_t^D
-        origin='aitchison' → e_t = A · (h_bar_t^D − h_bar)
+    Returns embedding of shape (V, d):
+        origin='ilr'       → e_t = h_bar_t^D
+        origin='aitchison' → e_t = h_bar_t^D − h_bar
 
     Args:
         Z: (V,) marginal token probabilities from Stage 1 (window=0).
@@ -559,7 +559,7 @@ def aitchison_token_embeddings_dt(
     else:
         delta = h_bar_t
 
-    embedding = (delta @ A.T).to(torch.float32).cpu().numpy()  # (V, V-1)
+    embedding = delta.to(torch.float32).cpu().numpy()  # (V, d)
 
     if target_tokens is not None:
         target_tokens = np.asarray(target_tokens, dtype=np.int64)
