@@ -11,45 +11,35 @@ An uncentered SVD (V_basis, S, projections) is only required by the global
 basis path; it is deferred by default and computed lazily on first use.
 Pass `compute_svd=True` to `build_viz_sample` if you want it up-front.
 
-The flow from shape.density is NOT used here: h_eff itself is a sample of the
-marginal g, so importance-weighted plots source their base sample from the
-empirical memmap instead of an approximating flow. This avoids both flow-fit
-error and the training step as a viz prerequisite.
+Public plotting API (three functions):
 
-Token-conditional density g(·|t) has two views, which together form a
-diagnostic for whether the model's learned direction for t matches where t
-actually appears:
+  plot_global_density(viz_sample, pcs, ...)
+      Heatmap of the unconditional empirical density g(·). pcs is a list of
+      PC indices; all non-diagonal (i, j) pairs are shown in a matrix layout
+      with columns sharing the x-axis and rows sharing the y-axis.
 
-  plot_token_density (model view): reuses the cached sample with importance
-    weights ω_i = p_t(h_i) / Z_t. Works for any token the model has learned
-    about, including tokens unseen in the extraction split. ESS collapses
-    if the typical sets of p_t and g have little overlap.
+  plot_density(viz_sample, W, Z, tokens, *, ...)
+      Filled-bands overlay of g(·|t) for one or more tokens. Single token →
+      basis='token' (per-token centered PCA) by default; multiple tokens →
+      basis='global'. Accepts token ids (int) or strings (str, requires stoi).
+      Z is the full (V,) marginals array. examples can be a DataFrame, an int
+      k (random corpus sample), or a list of phrase strings to search for.
 
-  plot_empirical_token_density (empirical view): filters the full h_eff
-    memmap to positions whose next corpus token is t. Unweighted — every
-    sample counts equally. Requires t to actually appear in the split.
+  plot_distinctiveness(viz_sample, W, Z, token, *, ...)
+      Diverging log-ratio heatmap D_t(y) = log[g(y|t)/g(y)] for a single
+      token. Same Z-array and string-token conveniences as plot_density.
 
 Both views support three bases:
 
-  basis='token' (default): compute a weighted, centered PCA of the
-    reweighted sample on the fly. This surfaces the principal directions of
-    polysemy specific to that token, at the cost of making axes
-    non-comparable across tokens.
+  basis='token' (default for single token): weighted, centered PCA of the
+    reweighted sample on the fly. Surfaces the principal directions of
+    polysemy for that token; axes non-comparable across tokens.
 
-  basis='global': use the cached global (uncentered) V_basis and
-    projections. Axes line up across plots — good for cross-token
-    comparison, but the directions are those of the marginal g(·), not of
-    g(·|t), so a given token's polysemy may lie off the leading PCs.
+  basis='global': cached global (uncentered) V_basis. Axes line up across
+    plots — good for cross-token comparison.
 
   basis='contrast': user-specified token-pair contrasts. Each axis projects
-    h onto W[pos] − W[neg], so the value is the log-odds
-    log p(pos|h)/p(neg|h) (the log-Z term cancels). Hypothesis-driven —
-    great for inspecting a known sense distinction (e.g. 'bank' along
-    money vs river), but axes are oblique in general.
-
-Rare-token caveat: the empirical view needs t to appear in the split; the
-model view needs non-trivial overlap between typical sets of p_t and g
-(watch the ESS reported in the subtitle).
+    h onto W[pos] − W[neg], giving the log-odds log p(pos|h)/p(neg|h).
 """
 
 import json
@@ -69,7 +59,6 @@ class VizSample:
     S: np.ndarray                 # (d,)   float32 — singular values of H (uncentered)
     projections: np.ndarray       # (N, k_pc) float32 — H @ V_basis[:, :k_pc]
     row_index: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=np.int64))
-    # ^ (N,) int64 — h_eff memmap row that each H[i] was drawn from
     meta: dict = field(default_factory=dict)
 
     @property
@@ -87,6 +76,14 @@ class VizSample:
     @property
     def has_svd(self):
         return self.V_basis.size > 0
+
+
+@dataclass
+class CorpusContext:
+    """Bundles the three corpus-access objects used together for example extraction."""
+    data: np.ndarray        # (T,) uint16 — corpus token ids
+    h_eff: np.ndarray       # (N_valid, d) float32 — Stage 1 h_eff memmap
+    extract_meta: dict      # loaded from {dataset}_meta.json
 
 
 def _svd_and_project(H, k_pc, *, verbose=False):
@@ -192,10 +189,8 @@ def build_viz_sample(
         if verbose:
             print(f"Subsampling {N:,} of {n_valid:,} h_eff rows (d={d}, seed={seed}).")
 
-    # Materialize subsample in RAM — N×d×4 bytes.
     H = np.asarray(h_eff_mm[row_index], dtype=np.float32)
 
-    # Per-sample log Z(h) = logsumexp_t (W[t] · h)
     if verbose:
         print(f"Computing log Z(h_i) via batched logsumexp over V={V}...")
     log_Z_of_h = np.empty(N, dtype=np.float32)
@@ -271,7 +266,6 @@ def load_viz_sample(path):
     """Load a cached VizSample from an .npz written by `build_viz_sample`."""
     arr = np.load(path, allow_pickle=False)
     meta = json.loads(str(arr['meta_json']))
-    # row_index was added after the flow-sample cache format; tolerate its absence.
     row_index = (arr['row_index'] if 'row_index' in arr.files
                  else np.empty(0, dtype=np.int64))
     return VizSample(
@@ -298,9 +292,7 @@ def token_weights(viz_sample, W, t, Z_t, stabilize=True):
         t: integer token id.
         Z_t: marginal probability of token t (from Stage 1's Z vector).
         stabilize: if True, subtract max(log ω) before exp — a positive constant
-            that does not change plotted density shape (stat_density_2d
-            renormalizes by total weight). Set False to recover true ω magnitudes
-            (e.g. for diagnostics like effective sample size).
+            that does not change plotted density shape. Set False for diagnostics.
 
     Returns:
         ω: np.ndarray of shape (N,), float32.
@@ -327,24 +319,12 @@ def _weighted_centered_basis(H, weights, center=True, eps=1e-12):
 
     Diagonalizes the d×d weighted covariance
         C = Σ ω_i (h_i − μ)(h_i − μ)^T / Σ ω_i
-    via `np.linalg.eigh`, which is cheaper than forming √ω·(H−μ) and
-    SVD-ing that N×d matrix when we only need a handful of top PCs.
-
-    Args:
-        H: (N, d) array of flow samples.
-        weights: (N,) non-negative importance weights ω_i. Must not be
-            identically zero.
-        center: if True, subtract the weighted mean before taking the
-            covariance — the "token-specific centered" basis. If False,
-            uses the origin as mean (matches the global uncentered
-            convention).
+    via `np.linalg.eigh`.
 
     Returns:
         mu: (d,) float32 — weighted mean, or zeros when `center=False`.
-        V:  (d, d) float32 — eigenvectors in columns, descending by
-            eigenvalue. Orthonormal.
-        eigvals_desc: (d,) float32 — eigenvalues in descending order
-            (variance along each principal direction).
+        V:  (d, d) float32 — eigenvectors in columns, descending by eigenvalue.
+        eigvals_desc: (d,) float32 — eigenvalues in descending order.
     """
     w = np.asarray(weights, dtype=np.float64)
     w_sum = float(w.sum())
@@ -395,44 +375,25 @@ def _require_plotnine():
     return pn, pd, gaussian_kde
 
 
-def _default_axis_labels(pcs, basis):
-    """Axis labels when no explicit pc_pair_labels are supplied.
+def _default_axis_labels(pairs, basis):
+    """Axis labels for (x, y) PC pairs.
 
-    basis='token' and basis='global' label PCs with their index and a
-    parenthetical basis tag; basis='contrast' callers always pass explicit
-    labels and skip this fallback.
+    pairs: list of (pi, pj) tuples.
+    basis: 'token' or 'global' — determines the parenthetical suffix.
     """
     tag = {'token': 'token', 'global': 'global'}.get(basis, '')
     suffix = f" ({tag})" if tag else ''
-    return [(f"PC{pi + 1}{suffix}", f"PC{pj + 1}{suffix}") for (pi, pj) in pcs]
+    return [(f"PC{pi + 1}{suffix}", f"PC{pj + 1}{suffix}") for (pi, pj) in pairs]
 
 
-def _strip_label(x_label, y_label):
-    """Two-line facet strip label, with x on top and y on bottom so the x
-    line reads adjacent to the bottom plot edge and the y line adjacent
-    to the side — a readable compromise since plotnine has no native
-    per-facet axis title."""
-    return f"x: {x_label}\ny: {y_label}"
-
-
-def _weighted_kde_long_df(projections, pcs, weights=None,
+def _weighted_kde_long_df(projections, pairs, weights=None,
                           n_grid=80, pad=0.05, bw_method=None,
                           pc_pair_labels=None):
     """
-    Compute a weighted 2D KDE on a regular grid for each PC pair and return a
-    long-form DataFrame suitable for `geom_raster`.
+    Weighted 2D KDE on a regular grid for each PC pair.
 
-    We compute the KDE manually because plotnine's `stat_density_2d` silently
-    ignores the `weight` aesthetic. scipy's `gaussian_kde` supports weights via
-    its constructor and adapts its Scott's-rule bandwidth to the effective
-    sample size Σw² / (Σw)², which is exactly what we want: rare-token plots
-    with low ESS automatically smooth more.
-
-    `pc_pair_labels` is a list of `(x_label, y_label)` tuples — one per facet.
-    Callers who want "PC1"/"PC2" defaults should pass None.
-
-    Returns a DataFrame with columns: x, y, density, pc_pair (combined strip
-    label), x_label, y_label.
+    pairs: list of (xi, yi) index pairs into projections columns.
+    Returns a DataFrame with columns: x, y, density, x_label, y_label.
     """
     _, pd, gaussian_kde = _require_plotnine()
     frames = []
@@ -440,7 +401,7 @@ def _weighted_kde_long_df(projections, pcs, weights=None,
     if w_arr is not None and w_arr.sum() <= 0:
         raise ValueError("All weights are zero/negative — cannot compute KDE.")
 
-    for idx, (pi, pj) in enumerate(pcs):
+    for idx, (pi, pj) in enumerate(pairs):
         x = projections[:, pi].astype(np.float64)
         y = projections[:, pj].astype(np.float64)
         xr = float(x.max() - x.min()) or 1.0
@@ -462,32 +423,27 @@ def _weighted_kde_long_df(projections, pcs, weights=None,
             'x': XX.ravel(),
             'y': YY.ravel(),
             'density': density.ravel(),
-            'pc_pair': _strip_label(x_label, y_label),
             'x_label': x_label,
             'y_label': y_label,
         }))
     return pd.concat(frames, ignore_index=True)
 
 
-def _log_ratio_kde_long_df(projections, pcs, weights, *,
+def _log_ratio_kde_long_df(projections, pairs, weights, *,
                            n_grid=80, pad=0.05, bw_method=None,
                            pc_pair_labels=None,
                            floor=1e-12):
-    """Per-facet log[ĝ_t(y) / ĝ(y)] on a regular grid.
+    """Per-pair log[ĝ_t(y) / ĝ(y)] on a regular grid.
 
-    Both KDEs use scipy.stats.gaussian_kde on the *same* (xy, grid) and the
-    *same* bandwidth — built once for the unweighted KDE and reused for the
-    weighted one — so the smoothing Jacobian cancels in the log-ratio.
-    `floor` clamps both densities away from zero before the log to keep
-    out-of-support corners finite (where they push the ratio to log 1 = 0).
-    Returns columns x, y, log_ratio, pc_pair, x_label, y_label.
+    pairs: list of (xi, yi) index pairs into projections columns.
+    Returns columns x, y, log_ratio, x_label, y_label.
     """
     _, pd, gaussian_kde = _require_plotnine()
     w_arr = np.asarray(weights, dtype=np.float64)
     if w_arr.sum() <= 0:
         raise ValueError("All weights are zero/negative — cannot compute KDE.")
     frames = []
-    for idx, (pi, pj) in enumerate(pcs):
+    for idx, (pi, pj) in enumerate(pairs):
         x = projections[:, pi].astype(np.float64)
         y = projections[:, pj].astype(np.float64)
         xr = float(x.max() - x.min()) or 1.0
@@ -499,8 +455,7 @@ def _log_ratio_kde_long_df(projections, pcs, weights, *,
         xy = np.vstack([x, y])
 
         kde_g = gaussian_kde(xy, bw_method=bw_method)
-        # Force the weighted KDE to use the same bandwidth so smoothing
-        # cancels in the log-ratio. scipy accepts a scalar bw factor here.
+        # Same bandwidth so smoothing Jacobian cancels in the log-ratio.
         kde_t = gaussian_kde(xy, weights=w_arr, bw_method=kde_g.factor)
         dens_g = kde_g(grid).reshape(n_grid, n_grid)
         dens_t = kde_t(grid).reshape(n_grid, n_grid)
@@ -515,10 +470,60 @@ def _log_ratio_kde_long_df(projections, pcs, weights, *,
             'x': XX.ravel(),
             'y': YY.ravel(),
             'log_ratio': log_ratio.ravel(),
-            'pc_pair': _strip_label(x_label, y_label),
             'x_label': x_label,
             'y_label': y_label,
         }))
+    return pd.concat(frames, ignore_index=True)
+
+
+def _multi_token_kde_long_df(projections, pairs, token_specs,
+                             *, n_grid=80, pad=0.05, bw_method=None,
+                             pc_pair_labels=None):
+    """Per-token weighted KDE on a shared grid for each PC pair.
+
+    pairs: list of (xi, yi) index pairs into projections columns.
+    token_specs: list of (name, weights-or-None). Densities are normalized
+    to [0, 1] per (token, facet).
+    Returns columns: x, y, density, x_label, y_label, token.
+    """
+    _, pd, gaussian_kde = _require_plotnine()
+    frames = []
+    for idx, (pi, pj) in enumerate(pairs):
+        x = projections[:, pi].astype(np.float64)
+        y = projections[:, pj].astype(np.float64)
+        xr = float(x.max() - x.min()) or 1.0
+        yr = float(y.max() - y.min()) or 1.0
+        xs = np.linspace(x.min() - pad * xr, x.max() + pad * xr, n_grid)
+        ys = np.linspace(y.min() - pad * yr, y.max() + pad * yr, n_grid)
+        XX, YY = np.meshgrid(xs, ys)
+        grid = np.vstack([XX.ravel(), YY.ravel()])
+        xy = np.vstack([x, y])
+
+        if pc_pair_labels is not None:
+            x_label, y_label = pc_pair_labels[idx]
+        else:
+            x_label, y_label = f"PC{pi + 1}", f"PC{pj + 1}"
+
+        for name, wts in token_specs:
+            w_arr = None if wts is None else np.asarray(wts, dtype=np.float64)
+            if w_arr is not None and w_arr.sum() <= 0:
+                raise ValueError(
+                    f"All weights are zero/negative for token {name!r} — "
+                    f"cannot compute KDE."
+                )
+            kde = gaussian_kde(xy, weights=w_arr, bw_method=bw_method)
+            density = kde(grid).reshape(n_grid, n_grid)
+            mx = float(density.max())
+            if mx > 0:
+                density = density / mx
+            frames.append(pd.DataFrame({
+                'x': XX.ravel(),
+                'y': YY.ravel(),
+                'density': density.ravel(),
+                'x_label': x_label,
+                'y_label': y_label,
+                'token': name,
+            }))
     return pd.concat(frames, ignore_index=True)
 
 
@@ -568,18 +573,8 @@ def sample_token_instances(
 
     Each sampled instance is projected into the cached global PC basis
     (`V_basis[:, :k_pc]`) and returned in wide form with `pc1`…`pc_{k_pc}`
-    columns for inspection and for the `basis='global'` plot path. The raw
-    `h_eff` vector is also stored on each row so `plot_token_density` can
-    re-project it into a token-specific centered basis at plot time. The
-    plot wrappers expand into facet rows themselves, so the *same* k
-    instances appear across every pc_pair panel.
-
-    The label decodes the last `context` corpus tokens ending at the target
-    token (`data[pos+1]` — the predicted token for that h_eff position).
-
-    Note on window averaging: when `window > 0`, `h_eff[i]` is the weighted h̄
-    around position `positions[i]`, not the raw `h_t`. The label still names
-    the target position's context; the plotted location is the smoothed vector.
+    columns for inspection. The raw `h_eff` vector is also stored on each row
+    so plot functions can re-project it into any basis at plot time.
 
     Args:
         viz_sample: VizSample — provides `V_basis` and `k_pc`.
@@ -588,14 +583,13 @@ def sample_token_instances(
         h_eff: `(N_valid, d)` memmap/array written by Stage 1.
         t: next-token id to filter on, or None for random valid positions.
         k: max number of instances to return.
-        context: number of tokens (ending at the target) to decode into the label.
-        decode: `list[int] -> str`; see `load_decode`. Defaults to space-
-            separated ids, which is ugly but works without a tokenizer.
+        context: number of tokens (ending at the target) to decode into label.
+        decode: `list[int] -> str`; defaults to space-separated ids.
         rng: numpy `Generator` (default `np.random.default_rng()`).
 
     Returns:
-        pandas.DataFrame with one row per instance and columns
-        {row_index, corpus_pos, label, pc1, pc2, ..., pc_{k_pc}}.
+        pandas.DataFrame with columns {row_index, corpus_pos, label, h_eff,
+        pc1, pc2, ..., pc_{k_pc}} (pc{k} only when SVD is cached).
     """
     _, pd, _ = _require_plotnine()
     if rng is None:
@@ -628,10 +622,6 @@ def sample_token_instances(
     chosen = np.sort(rng.choice(candidates, size=k_actual, replace=False))
 
     h_sel = np.asarray(h_eff[chosen], dtype=np.float32)          # (k, d)
-    # Global-PC projections are only meaningful if the SVD is cached. Skip
-    # them otherwise — `_examples_long_df` always re-projects from the raw
-    # h_eff vector onto whatever basis the plot is built against, so these
-    # pc{k} columns are just an optional convenience for direct inspection.
     if viz_sample.has_svd:
         V = viz_sample.V_basis[:, :viz_sample.k_pc]
         proj = h_sel @ V
@@ -644,7 +634,7 @@ def sample_token_instances(
     T = len(data)
     for idx in chosen:
         pos = int(positions[idx])
-        end = min(pos + 2, T)                # exclusive; include data[pos+1] when present
+        end = min(pos + 2, T)
         start = max(0, end - context)
         ids = np.asarray(data[start:end], dtype=np.int64).tolist()
         labels.append(decode(ids))
@@ -664,17 +654,142 @@ def sample_token_instances(
     return pd.DataFrame(rows)
 
 
-def _examples_long_df(examples_df, pcs, V_basis=None, center=None,
+def _find_phrase_instances(phrase, viz_sample, corpus_ctx, stoi, decode, phrase_avg):
+    """
+    Search the corpus for a phrase and return an examples DataFrame row.
+
+    phrase: whitespace-separated string of vocabulary words.
+    phrase_avg: 1 = use first occurrence; N>1 = average up to N occurrences.
+
+    The phrase is tokenized by splitting on whitespace and looking up each
+    word in `stoi`. Returns a one-row DataFrame (or empty DataFrame if not
+    found) compatible with `sample_token_instances` output.
+    """
+    _, pd, _ = _require_plotnine()
+    if stoi is None:
+        raise ValueError("stoi is required for phrase search examples.")
+    words = phrase.split()
+    try:
+        phrase_ids = [int(stoi[w]) for w in words]
+    except KeyError as missing:
+        raise ValueError(
+            f"Phrase word {missing} not found in stoi vocabulary. "
+            f"Check tokenization — vocabulary uses word-level tokens."
+        )
+    n = len(phrase_ids)
+    phrase_arr = np.array(phrase_ids, dtype=np.int64)
+
+    from shape.extract import valid_positions
+    positions = valid_positions(corpus_ctx.extract_meta)
+    data_arr = np.asarray(corpus_ctx.data, dtype=np.int64)
+    T = len(data_arr)
+
+    # Candidate rows: next token matches phrase[-1]
+    next_pos = positions + 1
+    in_range = next_pos < T
+    last_tok = np.where(in_range,
+                        data_arr[np.minimum(next_pos, T - 1)],
+                        np.int64(-1))
+    candidates = np.flatnonzero(last_tok == phrase_ids[-1])
+
+    matches = []
+    for i in candidates:
+        pos = int(positions[i])
+        # phrase spans data[pos-n+2 : pos+2]
+        start = pos - n + 2
+        end = pos + 2
+        if start < 0 or end > T:
+            continue
+        if np.array_equal(data_arr[start:end], phrase_arr):
+            matches.append(int(i))
+
+    if not matches:
+        return pd.DataFrame()
+
+    if phrase_avg == 1:
+        i = matches[0]
+        h = np.asarray(corpus_ctx.h_eff[i], dtype=np.float32)
+        return pd.DataFrame([{
+            'row_index': i,
+            'corpus_pos': int(positions[i]),
+            'label': phrase,
+            'h_eff': h,
+        }])
+    else:
+        selected = matches[:phrase_avg]
+        h_vecs = np.stack([np.asarray(corpus_ctx.h_eff[i], dtype=np.float32)
+                           for i in selected])
+        h = h_vecs.mean(axis=0)
+        return pd.DataFrame([{
+            'row_index': -1,
+            'corpus_pos': -1,
+            'label': phrase,
+            'h_eff': h,
+        }])
+
+
+def _resolve_examples(examples, ids, viz_sample, corpus_context, stoi, decode,
+                      phrase_avg):
+    """
+    Normalize the `examples` parameter to a DataFrame or None.
+
+    examples:
+      None       → no examples
+      DataFrame  → returned as-is
+      int k      → randomly sample k instances of ids[0] from corpus
+      list[str]  → phrase search; each phrase → one row in the output
+    """
+    _, pd, _ = _require_plotnine()
+    if examples is None:
+        return None
+    if isinstance(examples, pd.DataFrame):
+        return examples
+    if isinstance(examples, int):
+        if corpus_context is None:
+            raise ValueError(
+                "corpus_context is required when examples is an int (random sample)."
+            )
+        if len(ids) != 1:
+            raise ValueError(
+                "examples=k (random sampling) is only supported for single-token plots."
+            )
+        return sample_token_instances(
+            viz_sample,
+            corpus_context.extract_meta,
+            corpus_context.data,
+            corpus_context.h_eff,
+            t=ids[0],
+            k=examples,
+            decode=decode,
+        )
+    if isinstance(examples, list) and all(isinstance(e, str) for e in examples):
+        if corpus_context is None:
+            raise ValueError(
+                "corpus_context is required when examples is a list of phrases."
+            )
+        frames = []
+        for phrase in examples:
+            df = _find_phrase_instances(
+                phrase, viz_sample, corpus_context, stoi, decode, phrase_avg
+            )
+            if len(df) > 0:
+                frames.append(df)
+        if not frames:
+            return None
+        return pd.concat(frames, ignore_index=True)
+    raise ValueError(
+        f"examples must be None, a DataFrame, an int k, or a list of phrase strings; "
+        f"got {type(examples).__name__!r}."
+    )
+
+
+def _examples_long_df(examples_df, pairs, V_basis=None, center=None,
                       pc_pair_labels=None):
     """Expand a wide-form examples DataFrame into long-form facet rows.
 
-    Same k instances appear in every pc_pair — only (x, y) differs per facet.
-
-    When a `V_basis` is supplied and the DataFrame carries an `h_eff` column,
-    re-projects each instance on the fly (subtracting `center` first if
-    given). This is how `plot_token_density(basis='token')` places corpus
-    examples into the token-specific centered basis. Otherwise falls back
-    to the pre-computed `pc{k}` columns written by `sample_token_instances`.
+    pairs: list of (xi, yi) tuples indexing into the projection columns.
+    Same k instances appear in every pair — only (x, y) differs per facet.
+    Re-projects from the raw h_eff vector when V_basis is supplied.
     """
     _, pd, _ = _require_plotnine()
     has_h_eff = 'h_eff' in examples_df.columns
@@ -688,7 +803,7 @@ def _examples_long_df(examples_df, pcs, V_basis=None, center=None,
 
     parts = []
     base_cols = ['row_index', 'corpus_pos', 'label']
-    for idx, (pi, pj) in enumerate(pcs):
+    for idx, (pi, pj) in enumerate(pairs):
         sub = examples_df[base_cols].copy()
         if use_reproject:
             sub['x'] = proj[:, pi]
@@ -707,16 +822,16 @@ def _examples_long_df(examples_df, pcs, V_basis=None, center=None,
             x_label, y_label = pc_pair_labels[idx]
         else:
             x_label, y_label = f"PC{pi + 1}", f"PC{pj + 1}"
-        sub['pc_pair'] = _strip_label(x_label, y_label)
+        sub['x_label'] = x_label
+        sub['y_label'] = y_label
         parts.append(sub)
     return pd.concat(parts, ignore_index=True)
 
 
-def _senses_dataframe(senses, V_basis, pcs, center=None, pc_pair_labels=None):
+def _senses_dataframe(senses, V_basis, pairs, center=None, pc_pair_labels=None):
     """Project sense centroids onto the PC basis and return a long-form DF.
 
-    If `center` is provided (as in the token-specific centered basis),
-    subtracts it from each centroid before projecting.
+    pairs: list of (xi, yi) tuples.
     """
     _, pd, _ = _require_plotnine()
     S = np.asarray(senses, dtype=np.float32)
@@ -724,29 +839,30 @@ def _senses_dataframe(senses, V_basis, pcs, center=None, pc_pair_labels=None):
         S = S - np.asarray(center, dtype=np.float32)[None, :]
     centroid_proj = S @ np.asarray(V_basis, dtype=np.float32)     # (K, cols)
     rows = []
-    for idx, (pi, pj) in enumerate(pcs):
+    for idx, (pi, pj) in enumerate(pairs):
         if pc_pair_labels is not None:
             x_label, y_label = pc_pair_labels[idx]
         else:
             x_label, y_label = f"PC{pi + 1}", f"PC{pj + 1}"
-        strip = _strip_label(x_label, y_label)
         for k_idx in range(centroid_proj.shape[0]):
             rows.append({
                 'x': float(centroid_proj[k_idx, pi]),
                 'y': float(centroid_proj[k_idx, pj]),
-                'pc_pair': strip,
+                'x_label': x_label,
+                'y_label': y_label,
                 'sense': f"s{k_idx}",
             })
     return pd.DataFrame(rows)
 
 
 def _density_plot(df_grid, *, title, senses_df=None, examples_df=None):
+    """Heatmap renderer used by plot_global_density."""
     pn, _, _ = _require_plotnine()
     p = (
         pn.ggplot(df_grid, pn.aes('x', 'y'))
         + pn.geom_raster(pn.aes(fill='density'))
         + pn.scale_fill_cmap(cmap_name='viridis')
-        + pn.facet_wrap('~pc_pair', scales='free')
+        + pn.facet_grid('y_label ~ x_label', scales='free')
         + pn.coord_cartesian(expand=False)
         + pn.theme_minimal()
         + pn.labs(x=None, y=None, fill='density', title=title)
@@ -767,6 +883,7 @@ def _density_plot(df_grid, *, title, senses_df=None, examples_df=None):
 
 
 def _log_ratio_plot(df_grid, *, title, examples_df=None, clip=None):
+    """Diverging log-ratio heatmap renderer used by plot_distinctiveness."""
     pn, _, _ = _require_plotnine()
     df = df_grid
     if clip is not None:
@@ -778,7 +895,7 @@ def _log_ratio_plot(df_grid, *, title, examples_df=None, clip=None):
         + pn.geom_raster(pn.aes(fill='log_ratio'))
         + pn.scale_fill_gradient2(low='#2166ac', mid='#f7f7f7',
                                   high='#b2182b', midpoint=0)
-        + pn.facet_wrap('~pc_pair', scales='free')
+        + pn.facet_grid('y_label ~ x_label', scales='free')
         + pn.coord_cartesian(expand=False)
         + pn.theme_minimal()
         + pn.labs(x=None, y=None, fill='D_t(y)', title=title)
@@ -795,26 +912,78 @@ def _log_ratio_plot(df_grid, *, title, examples_df=None, clip=None):
     return p
 
 
-def plot_global_density(viz_sample, pcs=((0, 1), (2, 3), (4, 5)),
+def _filled_bands_plot(df, *, title, labels, colors, levels,
+                       senses_df=None, examples_df=None):
+    """
+    Stacked translucent band renderer used by plot_density.
+
+    df has columns: x, y, density (normalized to [0,1] per token per facet),
+    x_label, y_label, token (Categorical ordered by labels).
+    Bands are drawn in ascending threshold order so cores overlay halos.
+    """
+    pn, pd, _ = _require_plotnine()
+    df = df.copy()
+    df['token'] = pd.Categorical(df['token'], categories=list(labels), ordered=True)
+    color_map = {name: c for name, c in zip(labels, colors)}
+
+    p = (
+        pn.ggplot(df, pn.aes('x', 'y'))
+        + pn.facet_grid('y_label ~ x_label', scales='free')
+        + pn.coord_cartesian(expand=False)
+        + pn.theme_minimal()
+        + pn.labs(x=None, y=None, title=title, fill='token')
+        + pn.scale_fill_manual(values=color_map)
+    )
+    for level, alpha in sorted(levels, key=lambda la: la[0]):
+        band = df[df['density'] > level]
+        if len(band) == 0:
+            continue
+        p = p + pn.geom_tile(
+            band, pn.aes('x', 'y', fill='token'),
+            alpha=alpha, inherit_aes=False,
+        )
+    if senses_df is not None:
+        p = p + pn.geom_point(senses_df, pn.aes('x', 'y'),
+                              color='red', size=2.5, inherit_aes=False)
+    if examples_df is not None:
+        p = (
+            p
+            + pn.geom_point(examples_df, pn.aes('x', 'y'),
+                            color='black', size=1.8, inherit_aes=False)
+            + pn.geom_text(examples_df, pn.aes('x', 'y', label='label'),
+                           color='black', size=7, ha='left', va='bottom',
+                           inherit_aes=False)
+        )
+    return p
+
+
+def plot_global_density(viz_sample, pcs=(0, 1, 2, 3),
                         n_grid=80, bw_method=None,
                         title='Global density g(·)',
                         examples=None):
     """
-    Faceted plotnine heatmap of the unconditional empirical density g(·),
-    projected onto each PC pair of the cached uncentered SVD. The origin is
-    the "uniform-predictive-distribution" point in h_eff-space.
+    Faceted heatmap of the unconditional empirical density g(·).
 
-    `examples` is an optional long-form DataFrame from `sample_token_instances`
-    (pass `t=None` there for random corpus positions); its points and labels
-    are drawn on top of the heatmap.
+    pcs: list of PC indices. All non-diagonal (i, j) combinations are shown
+    in a matrix layout — columns share the x-axis PC, rows share the y-axis PC.
+
+    examples: optional DataFrame from `sample_token_instances` (pass t=None
+    there for random corpus positions).
     """
     _ensure_svd(viz_sample, verbose=False)
+    pcs = list(pcs)
     _check_pcs(pcs, viz_sample.k_pc)
-    df = _weighted_kde_long_df(viz_sample.projections, pcs,
-                               weights=None, n_grid=n_grid, bw_method=bw_method)
-    V_cols = viz_sample.V_basis[:, :viz_sample.k_pc]
-    ex_long = _examples_long_df(examples, pcs, V_basis=V_cols, center=None) \
-        if examples is not None else None
+    max_pc = max(pcs) + 1
+    V_cols = viz_sample.V_basis[:, :max_pc]
+    projections = (viz_sample.H @ V_cols).astype(np.float32)
+    pairs = [(i, j) for i in pcs for j in pcs if i != j]
+    pc_pair_labels = _default_axis_labels(pairs, basis='global')
+    df = _weighted_kde_long_df(projections, pairs, weights=None,
+                               n_grid=n_grid, bw_method=bw_method,
+                               pc_pair_labels=pc_pair_labels)
+    ex_long = (_examples_long_df(examples, pairs, V_basis=V_cols, center=None,
+                                 pc_pair_labels=pc_pair_labels)
+               if examples is not None else None)
     return _density_plot(df, title=title, examples_df=ex_long)
 
 
@@ -824,11 +993,6 @@ def _contrast_basis(W, axes, decode=None):
     to direction `W[pos] - W[neg]` in h-space; projecting h onto it yields
     the log-odds `log p(pos|h) / p(neg|h)` (the log-Z term cancels). Reused
     contrasts across facets are deduplicated.
-
-    Args:
-        W: (V, d) tensor or array — `model.lm_head.weight`.
-        axes: iterable of `((pos_x, neg_x), (pos_y, neg_y))` per facet.
-        decode: optional `list[int] -> str` for human-readable facet titles.
 
     Returns:
         V_cols: (d, n_unique) basis matrix.
@@ -883,26 +1047,23 @@ def _contrast_label(spec, decode):
 
 def _dispatch_basis(H_np, weights, viz_sample, W, *,
                     basis, pcs, axes, decode):
-    """Project H_np onto the chosen 2D basis and return rendering inputs.
+    """Project H_np onto the chosen basis and return rendering inputs.
 
-    Shared by `_project_and_plot` (density rendering) and
-    `plot_token_distinctiveness` (log-ratio rendering). Returns
-    `(projections, V_cols, center, pcs_resolved, pc_pair_labels)`:
-
+    pcs: list of ints for basis='token'/'global', or ignored for basis='contrast'.
+    Returns (projections, V_cols, center, pairs, pc_pair_labels):
       - projections: (N, k) array of H_np projected onto V_cols
-      - V_cols:      (d, k) basis matrix used for the projection
-      - center:      (d,) shift that was subtracted before projection,
-                     or None when the basis is uncentered. Examples and
-                     sense centroids are re-projected with the same shift.
-      - pcs_resolved: pcs as the renderer should index into projections
-                      (rewritten by 'contrast' to point into V_cols)
-      - pc_pair_labels: list of (x_label, y_label), one per facet
+      - V_cols:      (d, k) basis matrix
+      - center:      (d,) shift subtracted before projection, or None
+      - pairs:       list of (xi, yi) tuples indexing into projections columns
+      - pc_pair_labels: list of (x_label, y_label), one per pair
     """
     if basis == 'token':
-        max_pc = max(max(pi, pj) for (pi, pj) in pcs) + 1
+        if not pcs:
+            raise ValueError("pcs must be non-empty.")
+        max_pc = max(pcs) + 1
         if max_pc > H_np.shape[1]:
             raise ValueError(
-                f"PC pair index {max_pc - 1} exceeds d={H_np.shape[1]}; the "
+                f"PC index {max_pc - 1} exceeds d={H_np.shape[1]}; the "
                 f"token basis has at most d components."
             )
         pca_weights = (np.ones(H_np.shape[0], dtype=np.float32)
@@ -910,173 +1071,214 @@ def _dispatch_basis(H_np, weights, viz_sample, W, *,
         mu, V_full, _ = _weighted_centered_basis(H_np, pca_weights, center=True)
         V_cols = V_full[:, :max_pc]
         projections = (H_np - mu[None, :]) @ V_cols
-        return (projections, V_cols, mu, pcs,
-                _default_axis_labels(pcs, basis='token'))
+        pairs = [(i, j) for i in pcs for j in pcs if i != j]
+        return projections, V_cols, mu, pairs, _default_axis_labels(pairs, 'token')
+
     if basis == 'global':
         _ensure_svd(viz_sample, verbose=False)
         _check_pcs(pcs, viz_sample.k_pc)
-        V_cols = viz_sample.V_basis[:, :viz_sample.k_pc]
+        max_pc = max(pcs) + 1
+        V_cols = viz_sample.V_basis[:, :max_pc]
         projections = H_np @ V_cols
-        return (projections, V_cols, None, pcs,
-                _default_axis_labels(pcs, basis='global'))
+        pairs = [(i, j) for i in pcs for j in pcs if i != j]
+        return projections, V_cols, None, pairs, _default_axis_labels(pairs, 'global')
+
     if basis == 'contrast':
         if axes is None:
             raise ValueError(
                 "basis='contrast' requires axes=[((pos,neg),(pos,neg)),...]"
             )
-        V_cols, pcs_resolved, pc_pair_labels = _contrast_basis(
-            W, axes, decode=decode)
+        V_cols, facet_pairs, labels = _contrast_basis(W, axes, decode=decode)
         projections = H_np @ V_cols
-        return projections, V_cols, None, pcs_resolved, pc_pair_labels
+        return projections, V_cols, None, facet_pairs, labels
+
     raise ValueError(
         f"basis must be 'token', 'global', or 'contrast', got {basis!r}"
     )
 
 
-def _project_and_plot(H, weights, viz_sample, W, *,
-                      basis, pcs, axes, decode,
-                      senses, examples,
-                      title, n_grid, bw_method):
-    """Shared basis dispatch + weighted KDE + compose for token-conditional plots.
+def _resolve_tokens(tokens_input, Z, stoi=None):
+    """Normalize tokens_input to (ids: list[int], labels: list[str]).
 
-    `H` is the sample we KDE over; `weights` is the per-row weight vector
-    (None for unweighted). `viz_sample` contributes the cached global basis
-    only (used by basis='global'); its `.H` is not read here.
-
-    For basis='token', builds the PCA on the same (H, weights) passed in —
-    so the basis reflects whichever sample the caller is plotting, not the
-    global cache.
+    Accepts a single int/str or a list of either. String tokens require stoi.
     """
-    H_np = np.asarray(H, dtype=np.float32)
-    projections, V_cols, center, pcs, pc_pair_labels = _dispatch_basis(
-        H_np, weights, viz_sample, W,
-        basis=basis, pcs=pcs, axes=axes, decode=decode,
+    if not isinstance(tokens_input, list):
+        tokens_input = [tokens_input]
+    V = len(Z)
+    ids = []
+    labels = []
+    for t in tokens_input:
+        if isinstance(t, str):
+            if stoi is None:
+                raise ValueError(
+                    f"stoi is required to look up string token {t!r}."
+                )
+            if t not in stoi:
+                raise ValueError(f"Token {t!r} not found in stoi vocabulary.")
+            i = int(stoi[t])
+            labels.append(t)
+        elif isinstance(t, (int, np.integer)):
+            i = int(t)
+            labels.append(f"id={i}")
+        else:
+            raise ValueError(
+                f"Token must be int or str, got {type(t).__name__!r}."
+            )
+        if not (0 <= i < V):
+            raise ValueError(f"Token id {i} out of range [0, {V}).")
+        ids.append(i)
+    return ids, labels
+
+
+def plot_density(viz_sample, W, Z, tokens, *,
+                 stoi=None,
+                 labels=None,
+                 pcs=(0, 1, 2, 3),
+                 basis=None,
+                 axes=None,
+                 decode=None,
+                 senses=None,
+                 title=None,
+                 n_grid=80,
+                 bw_method=None,
+                 colors=None,
+                 levels=((0.2, 0.15), (0.5, 0.25), (0.8, 0.4)),
+                 examples=None,
+                 corpus_context=None,
+                 phrase_avg=1):
+    """
+    Filled-bands overlay of token-conditional density g(·|t) for one or more
+    tokens. Each token is drawn as stacked translucent bands; darker core,
+    lighter halo. Works for 1 to N tokens on a shared basis.
+
+    pcs: list of PC indices. All non-diagonal (i, j) pairs are shown in a
+    matrix layout (columns = x-axis PC, rows = y-axis PC). Default: [0,1,2,3].
+
+    tokens: int | str | list[int | str]. String tokens require `stoi`.
+    Z: full (V,) marginals array (no need to extract Z_t per token).
+
+    basis: 'token' (default for single token) uses a weighted centered PCA —
+    axes show the principal polysemy directions for that token, non-comparable
+    across tokens. 'global' uses the cached uncentered SVD (shared axes across
+    tokens). 'contrast' uses token-pair log-odds axes (see `axes`). For
+    multiple tokens, basis defaults to 'global'.
+
+    examples: None | int k (random corpus sample, single-token only) |
+    list[str] (phrase search — first occurrence or average of phrase_avg
+    occurrences) | DataFrame from sample_token_instances.
+    corpus_context: CorpusContext, required when examples is int or list[str].
+    phrase_avg: 1 = first corpus occurrence; N>1 = average N occurrences.
+
+    senses: optional (K, d) array of sense centroids overlaid as red points
+    (single-token only; silently ignored for multi-token).
+    """
+    Z_arr = np.asarray(Z)
+    ids, auto_labels = _resolve_tokens(tokens, Z_arr, stoi=stoi)
+    if labels is None:
+        labels = auto_labels
+    if len(labels) != len(ids):
+        raise ValueError("len(labels) must equal len(tokens).")
+
+    if basis is None:
+        basis = 'token' if len(ids) == 1 else 'global'
+    if basis == 'token' and len(ids) > 1:
+        raise ValueError(
+            "basis='token' is not supported for multiple tokens — each token "
+            "would need its own basis. Use basis='global' or basis='contrast'."
+        )
+
+    if colors is None:
+        _palette = ['#d62728', '#1f77b4', '#2ca02c', '#9467bd',
+                    '#ff7f0e', '#8c564b', '#e377c2', '#7f7f7f']
+        colors = _palette[:len(ids)]
+    if len(colors) != len(ids):
+        raise ValueError("len(colors) must equal len(tokens).")
+
+    # Per-token weights and ESS
+    weight_specs = []
+    ess_tags = []
+    for t, lbl in zip(ids, labels):
+        omega = token_weights(viz_sample, W, t, float(Z_arr[t]))
+        weight_specs.append((lbl, omega))
+        ess_tags.append(f"{lbl}: ESS={effective_sample_size(omega):.0f}")
+
+    H_np = np.asarray(viz_sample.H, dtype=np.float32)
+    pcs_list = list(pcs)
+
+    if basis == 'token':
+        # Build basis from the single token's weights
+        _, omega_0 = weight_specs[0]
+        projections, V_cols, center, pairs, pc_pair_labels = _dispatch_basis(
+            H_np, omega_0, viz_sample, W,
+            basis='token', pcs=pcs_list, axes=axes, decode=decode,
+        )
+    else:
+        projections, V_cols, center, pairs, pc_pair_labels = _dispatch_basis(
+            H_np, None, viz_sample, W,
+            basis=basis, pcs=pcs_list, axes=axes, decode=decode,
+        )
+
+    df = _multi_token_kde_long_df(
+        projections, pairs, weight_specs,
+        n_grid=n_grid, bw_method=bw_method, pc_pair_labels=pc_pair_labels,
     )
-    df = _weighted_kde_long_df(projections, pcs,
-                               weights=weights, n_grid=n_grid,
-                               bw_method=bw_method,
-                               pc_pair_labels=pc_pair_labels)
-    senses_df = _senses_dataframe(senses, V_cols, pcs, center=center,
-                                  pc_pair_labels=pc_pair_labels) \
-        if senses is not None else None
-    ex_long = _examples_long_df(examples, pcs,
-                                V_basis=V_cols, center=center,
-                                pc_pair_labels=pc_pair_labels) \
-        if examples is not None else None
-    return _density_plot(df, title=title,
-                         senses_df=senses_df, examples_df=ex_long)
 
+    ex_df = _resolve_examples(examples, ids, viz_sample, corpus_context,
+                              stoi, decode, phrase_avg)
+    ex_long = (_examples_long_df(ex_df, pairs, V_basis=V_cols, center=center,
+                                 pc_pair_labels=pc_pair_labels)
+               if ex_df is not None else None)
 
+    senses_df = None
+    if senses is not None and len(ids) == 1:
+        senses_df = _senses_dataframe(senses, V_cols, pairs, center=center,
+                                      pc_pair_labels=pc_pair_labels)
 
-
-def plot_token_density(viz_sample, W, t, Z_t, *,
-                       pcs=((0, 1), (2, 3), (4, 5)),
-                       basis='token',
-                       axes=None,
-                       decode=None,
-                       senses=None,
-                       token_label=None,
-                       title=None,
-                       n_grid=80,
-                       bw_method=None,
-                       examples=None):
-    """
-    Faceted plotnine heatmap of the token-conditional density g(·|t) — the
-    model view. Uses importance weights ω_i = p_t(h_i)/Z_t on the cached
-    h_eff subsample, which works for any token the model has learned about
-    (even tokens that never appear in the extraction split).
-
-    Plotnine's own `stat_density_2d` ignores the `weight` aesthetic, so we
-    precompute a weighted KDE with scipy.stats.gaussian_kde and render via
-    `geom_raster`. Scott's-rule bandwidth automatically widens for low-ESS
-    tokens (rare words) — the ESS is reported in the title so you can see
-    when the plot is effectively summarizing a handful of samples.
-
-    For the complementary corpus-occurrence view, see
-    `plot_empirical_token_density`.
-
-    Args:
-        viz_sample: VizSample from `build_viz_sample` / `load_viz_sample`.
-        W: (V, d) torch tensor or numpy array — `model.lm_head.weight`.
-        t: integer token id.
-        Z_t: marginal probability of token t.
-        pcs: iterable of (i, j) pairs naming which PC pairs to facet over.
-            Ignored when basis='contrast' (use `axes` instead).
-        basis: 'token' (default) computes a weighted, centered PCA of the
-            reweighted sample on the fly — axes are the principal directions
-            of polysemy for *this* token, at the cost of not being
-            comparable across tokens. 'global' uses the cached uncentered
-            V_basis, which keeps axes identical across plots but may miss
-            the token's polysemy directions. 'contrast' uses user-specified
-            token-pair contrasts (see `axes`); each axis projects h to the
-            log-odds log p(pos|h)/p(neg|h) for a chosen pair.
-        axes: required when basis='contrast'. Iterable of
-            `((pos_x, neg_x), (pos_y, neg_y))` per facet — token ids defining
-            the x and y log-odds contrasts. Reused contrasts are deduplicated.
-        decode: optional `list[int] -> str`; if provided with basis='contrast',
-            facet titles render as `log p('foo')/p('bar')` instead of token ids.
-        senses: optional (K, d) array of sense centroids in h_eff-space;
-            overlaid as red points on each facet.
-        token_label: human-readable token (e.g. the character/word); used in
-            the default title. If None, title falls back to `id=<t>`.
-        n_grid: KDE evaluation grid size per axis (default 80 → 6400 cells).
-        bw_method: forwarded to scipy.stats.gaussian_kde; default (None) uses
-            Scott's rule on the effective sample size.
-        examples: optional long-form DataFrame from `sample_token_instances`,
-            overlaid as labeled points on each facet.
-    """
-    weights = token_weights(viz_sample, W, t, Z_t)
-    ess = effective_sample_size(weights)
-    label = token_label if token_label is not None else f"id={t}"
-    default_title = f'g(·|t) for {label}  [ESS={ess:.0f}/{viz_sample.N}]'
-    return _project_and_plot(
-        viz_sample.H, weights, viz_sample, W,
-        basis=basis, pcs=pcs, axes=axes, decode=decode,
-        senses=senses, examples=examples,
+    default_title = 'g(·|t): ' + ',  '.join(ess_tags)
+    return _filled_bands_plot(
+        df,
         title=title or default_title,
-        n_grid=n_grid, bw_method=bw_method,
+        labels=labels,
+        colors=colors,
+        levels=levels,
+        senses_df=senses_df,
+        examples_df=ex_long,
     )
 
 
-def plot_token_distinctiveness(viz_sample, W, t, Z_t, *,
-                               pcs=((0, 1), (2, 3), (4, 5)),
-                               basis='token',
-                               axes=None,
-                               decode=None,
-                               token_label=None,
-                               title=None,
-                               n_grid=80,
-                               bw_method=None,
-                               examples=None,
-                               clip=None):
+def plot_distinctiveness(viz_sample, W, Z, token, *,
+                         stoi=None,
+                         pcs=(0, 1, 2, 3),
+                         basis='token',
+                         axes=None,
+                         decode=None,
+                         title=None,
+                         n_grid=80,
+                         bw_method=None,
+                         examples=None,
+                         corpus_context=None,
+                         phrase_avg=1,
+                         clip=None):
     """
-    Faceted plotnine heatmap of the distinctiveness field
-        D_t(y) = log[g(y|t) / g(y)]
-    on the chosen 2D projection. Renders as a diverging fill (red =
-    distinctive of t, blue = anti-distinctive, white = 0).
+    Diverging log-ratio heatmap of D_t(y) = log[g(y|t) / g(y)].
 
-    Computed as log of two same-grid KDEs: a weighted KDE for ĝ(y|t) and an
-    unweighted KDE for ĝ(y). The bandwidth is shared between the two so the
-    smoothing Jacobian cancels and the rendered value is a 2D analog of the
-    literal log-ratio. Sign and units (nats) are meaningful.
+    Red = regions distinctive of token t; blue = anti-distinctive; white = 0.
+    Title reports the scalar D_t = D_KL(g(·|t) ‖ g(·)) and ESS.
 
-    Title reports the scalar D_t = D_KL(g(·|t) ‖ g(·)) and ESS, computed via
-    `shape.distinctiveness.expected_distinctiveness`.
-
-    Args:
-        viz_sample, W, t, Z_t, pcs, basis, axes, decode, token_label, title,
-        n_grid, bw_method, examples: see `plot_token_density`. There is no
-            `senses` argument — sense centroids are positions on g(·|t), not
-            on the log-ratio.
-        clip: optional (lo, hi) tuple bounding the log-ratio color scale.
-            A few high-magnitude cells (typically near the support edge,
-            where one density goes to floor) can otherwise wash out the
-            interior. Try (-3, 3) for nats.
+    token: single int or str. Z is the full (V,) marginals array.
+    pcs, basis, axes, decode, examples, corpus_context, phrase_avg: see
+    plot_density. clip: optional (lo, hi) to bound the color scale (e.g. (-3,3)).
     """
     from shape.distinctiveness import expected_distinctiveness
-    weights = token_weights(viz_sample, W, t, Z_t)
-    summary = expected_distinctiveness(viz_sample, W, t, Z_t)
-    label = token_label if token_label is not None else f"id={t}"
+    Z_arr = np.asarray(Z)
+    ids, auto_labels = _resolve_tokens(token, Z_arr, stoi=stoi)
+    if len(ids) != 1:
+        raise ValueError("plot_distinctiveness accepts exactly one token.")
+    t = ids[0]
+    label = auto_labels[0]
+
+    weights = token_weights(viz_sample, W, t, float(Z_arr[t]))
+    summary = expected_distinctiveness(viz_sample, W, t, float(Z_arr[t]))
     default_title = (
         f'D_t(y) for {label}  '
         f'[D_t={summary["D_t"]:.2f} nats, '
@@ -1084,62 +1286,39 @@ def plot_token_distinctiveness(viz_sample, W, t, Z_t, *,
     )
 
     H_np = np.asarray(viz_sample.H, dtype=np.float32)
-    projections, V_cols, center, pcs_resolved, pc_pair_labels = _dispatch_basis(
+    projections, V_cols, center, pairs, pc_pair_labels = _dispatch_basis(
         H_np, weights, viz_sample, W,
-        basis=basis, pcs=pcs, axes=axes, decode=decode,
+        basis=basis, pcs=list(pcs), axes=axes, decode=decode,
     )
-    df = _log_ratio_kde_long_df(projections, pcs_resolved, weights,
+    df = _log_ratio_kde_long_df(projections, pairs, weights,
                                 n_grid=n_grid, bw_method=bw_method,
                                 pc_pair_labels=pc_pair_labels)
-    ex_long = (_examples_long_df(examples, pcs_resolved,
-                                 V_basis=V_cols, center=center,
+    ex_df = _resolve_examples(examples, ids, viz_sample, corpus_context,
+                              stoi, decode, phrase_avg)
+    ex_long = (_examples_long_df(ex_df, pairs, V_basis=V_cols, center=center,
                                  pc_pair_labels=pc_pair_labels)
-               if examples is not None else None)
+               if ex_df is not None else None)
     return _log_ratio_plot(df, title=title or default_title,
                            examples_df=ex_long, clip=clip)
 
 
-def plot_empirical_token_density(viz_sample, W, t, extract_meta, data, h_eff, *,
-                                 pcs=((0, 1), (2, 3), (4, 5)),
-                                 basis='token',
-                                 axes=None,
-                                 decode=None,
-                                 senses=None,
-                                 token_label=None,
-                                 title=None,
-                                 n_grid=80,
-                                 bw_method=None,
-                                 max_samples=10_000,
-                                 rng=None,
-                                 examples=None):
-    """
-    Faceted plotnine heatmap of the empirical token-conditional — the
-    corpus-occurrence view. Filters the full h_eff memmap to positions whose
-    *next corpus token* is `t`, and KDEs the resulting (unweighted) sample.
+def _plot_empirical_token_density(viz_sample, W, t, extract_meta, data, h_eff, *,
+                                  pcs=(0, 1, 2, 3),
+                                  basis='token',
+                                  axes=None,
+                                  decode=None,
+                                  senses=None,
+                                  token_label=None,
+                                  title=None,
+                                  n_grid=80,
+                                  bw_method=None,
+                                  max_samples=10_000,
+                                  rng=None,
+                                  examples=None):
+    """Corpus-occurrence view: KDE over actual positions where next-token == t.
 
-    Complementary to `plot_token_density`: that one shows where the model
-    would put mass for t; this one shows where t actually appeared. Agreement
-    is reassuring; disagreement is a signal.
-
-    Args:
-        viz_sample: VizSample — used for the cached `V_basis` when
-            basis='global'. Its `.H` is not consumed here.
-        W: (V, d) tensor or array — `model.lm_head.weight`. Only used when
-            basis='contrast'.
-        t: integer token id.
-        extract_meta: dict from `{dataset_name}_meta.json` — used to map
-            h_eff memmap rows to corpus positions.
-        data: corpus memmap/array (uint16) used in Stage 1.
-        h_eff: `(N_valid, d)` memmap/array written by Stage 1.
-        max_samples: cap on KDE input size. If more positions qualify,
-            subsamples uniformly (seeded by `rng`). KDE scales as
-            n_grid² × n_samples, so 10k keeps per-facet cost modest.
-        rng: numpy `Generator` (default `np.random.default_rng()`).
-        other args: see `plot_token_density`.
-
-    Raises:
-        ValueError if no corpus positions have next-token == t. For truly
-        rare tokens, prefer `plot_token_density` (the model view).
+    Complementary diagnostic to plot_density (the model view). This function
+    is private; prefer plot_density for general use.
     """
     from shape.extract import valid_positions
     if rng is None:
@@ -1161,7 +1340,7 @@ def plot_empirical_token_density(viz_sample, W, t, extract_meta, data, h_eff, *,
     if n_total == 0:
         raise ValueError(
             f"No valid positions with next-token == id={t} in this split. "
-            f"Use plot_token_density for the model view of rare/unseen tokens."
+            f"Use plot_density for the model view of rare/unseen tokens."
         )
 
     if n_total > max_samples:
@@ -1170,190 +1349,38 @@ def plot_empirical_token_density(viz_sample, W, t, extract_meta, data, h_eff, *,
 
     label = token_label if token_label is not None else f"id={t}"
     shown = len(idx)
-    n_tag = (f"n={shown}" if shown == n_total
-             else f"n={shown}/{n_total}")
+    n_tag = f"n={shown}" if shown == n_total else f"n={shown}/{n_total}"
     default_title = f'g_emp(·|t) for {label}  [{n_tag}]'
-    return _project_and_plot(
-        H_sub, None, viz_sample, W,
-        basis=basis, pcs=pcs, axes=axes, decode=decode,
-        senses=senses, examples=examples,
-        title=title or default_title,
-        n_grid=n_grid, bw_method=bw_method,
+
+    H_np = np.asarray(H_sub, dtype=np.float32)
+    pcs_list = list(pcs)
+    projections, V_cols, center, pairs, pc_pair_labels = _dispatch_basis(
+        H_np, None, viz_sample, W,
+        basis=basis, pcs=pcs_list, axes=axes, decode=decode,
     )
-
-
-def _multi_token_kde_long_df(projections, pcs, token_specs,
-                             *, n_grid=80, pad=0.05, bw_method=None,
-                             pc_pair_labels=None):
-    """Per-token weighted KDE on a shared (x, y) grid for each facet.
-
-    `token_specs` is a list of `(name, weights-or-None)`. Densities are
-    normalized to [0, 1] per (token, facet) so contour levels like
-    [0.3, 0.6] read as relative density regardless of each token's
-    absolute mass.
-    """
-    _, pd, gaussian_kde = _require_plotnine()
-    frames = []
-    for idx, (pi, pj) in enumerate(pcs):
-        x = projections[:, pi].astype(np.float64)
-        y = projections[:, pj].astype(np.float64)
-        xr = float(x.max() - x.min()) or 1.0
-        yr = float(y.max() - y.min()) or 1.0
-        xs = np.linspace(x.min() - pad * xr, x.max() + pad * xr, n_grid)
-        ys = np.linspace(y.min() - pad * yr, y.max() + pad * yr, n_grid)
-        XX, YY = np.meshgrid(xs, ys)
-        grid = np.vstack([XX.ravel(), YY.ravel()])
-        xy = np.vstack([x, y])
-
-        if pc_pair_labels is not None:
-            x_label, y_label = pc_pair_labels[idx]
-        else:
-            x_label, y_label = f"PC{pi + 1}", f"PC{pj + 1}"
-        strip = _strip_label(x_label, y_label)
-
-        for name, wts in token_specs:
-            w_arr = None if wts is None else np.asarray(wts, dtype=np.float64)
-            if w_arr is not None and w_arr.sum() <= 0:
-                raise ValueError(
-                    f"All weights are zero/negative for token {name!r} — "
-                    f"cannot compute KDE."
-                )
-            kde = gaussian_kde(xy, weights=w_arr, bw_method=bw_method)
-            density = kde(grid).reshape(n_grid, n_grid)
-            mx = float(density.max())
-            if mx > 0:
-                density = density / mx
-            frames.append(pd.DataFrame({
-                'x': XX.ravel(),
-                'y': YY.ravel(),
-                'density': density.ravel(),
-                'pc_pair': strip,
-                'token': name,
-            }))
-    return pd.concat(frames, ignore_index=True)
-
-
-def plot_token_comparison(viz_sample, W, Z, tokens, *,
-                          labels=None,
-                          pcs=((0, 1), (2, 3), (4, 5)),
-                          basis='global',
-                          axes=None,
-                          decode=None,
-                          title=None,
-                          n_grid=80,
-                          bw_method=None,
-                          colors=None,
-                          levels=((0.2, 0.15), (0.5, 0.25), (0.8, 0.4))):
-    """
-    Overlay the model-view densities `g(·|t)` for two or more tokens on a
-    shared basis, so senses can be compared directly. Each token is drawn as
-    stacked translucent bands — outer band at `levels[0]`, core at `levels[-1]`
-    — visually approximating filled contours.
-
-    Normalization is per-token-per-facet, so a concentrated rare token and a
-    diffuse frequent token show up on comparable scales — level thresholds
-    read as "fraction of this token's peak density in this facet".
-
-    Args:
-        viz_sample: VizSample.
-        W: (V, d) tensor or array — `model.lm_head.weight`.
-        Z: (V,) marginals. `Z[t]` must be positive for every `t` in tokens.
-        tokens: list of token ids to overlay (≥ 2).
-        labels: optional list[str] naming each token (used in the legend).
-            Defaults to `[f"id={t}" for t in tokens]`.
-        pcs: PC pairs to facet over (ignored when basis='contrast').
-        basis: 'global' (default) or 'contrast'. 'token' is rejected because
-            a per-token weighted PCA can't be shared across tokens.
-        axes: required when basis='contrast'.
-        decode: optional `list[int]->str` for contrast titles.
-        title: overall plot title; defaults to ESS summary if None.
-        n_grid, bw_method: KDE params forwarded to `plot_token_density`.
-        colors: optional list of colors for each token. Defaults to the first
-            len(tokens) colors from the Tableau 10 palette.
-        levels: iterable of (threshold, alpha) pairs defining the translucent
-            bands per token. Thresholds are relative to each token's own peak
-            density per facet; alpha controls the fill opacity of each band.
-    """
-    pn, pd, _ = _require_plotnine()
-    if len(tokens) < 2:
-        raise ValueError("plot_token_comparison needs at least two tokens.")
-    if basis == 'token':
-        raise ValueError(
-            "basis='token' is not supported for plot_token_comparison "
-            "(each token would want its own basis — use 'global' or "
-            "'contrast')."
-        )
-    if labels is None:
-        labels = [f"id={t}" for t in tokens]
-    if len(labels) != len(tokens):
-        raise ValueError("len(labels) must equal len(tokens).")
-    if colors is None:
-        default_palette = ['#d62728', '#1f77b4', '#2ca02c', '#9467bd',
-                           '#ff7f0e', '#8c564b', '#e377c2', '#7f7f7f']
-        colors = default_palette[:len(tokens)]
-    if len(colors) != len(tokens):
-        raise ValueError("len(colors) must equal len(tokens).")
-
-    # Compute per-token weights + ESS on the shared cached H.
-    weight_specs = []
-    ess_tags = []
-    for t, name in zip(tokens, labels):
-        omega = token_weights(viz_sample, W, int(t), float(Z[int(t)]))
-        weight_specs.append((name, omega))
-        ess_tags.append(f"{name}: ESS={effective_sample_size(omega):.0f}")
-
-    # Basis dispatch — reuse the single-token helpers but over viz_sample.H.
-    H_np = np.asarray(viz_sample.H, dtype=np.float32)
-    if basis == 'global':
-        _ensure_svd(viz_sample, verbose=False)
-        _check_pcs(pcs, viz_sample.k_pc)
-        V_cols = viz_sample.V_basis[:, :viz_sample.k_pc]
-        projections = H_np @ V_cols
-        pc_pair_labels = _default_axis_labels(pcs, basis='global')
-    elif basis == 'contrast':
-        if axes is None:
-            raise ValueError(
-                "basis='contrast' requires axes=[((pos,neg),(pos,neg)),...]"
-            )
-        V_cols, pcs, pc_pair_labels = _contrast_basis(W, axes, decode=decode)
-        projections = H_np @ V_cols
-    else:
-        raise ValueError(
-            f"basis must be 'global' or 'contrast', got {basis!r}"
-        )
-
+    token_specs = [(label, None)]
     df = _multi_token_kde_long_df(
-        projections, pcs, weight_specs,
-        n_grid=n_grid, bw_method=bw_method,
-        pc_pair_labels=pc_pair_labels,
+        projections, pairs, token_specs,
+        n_grid=n_grid, bw_method=bw_method, pc_pair_labels=pc_pair_labels,
     )
-    # Freeze legend order to match `labels`.
-    df['token'] = pd.Categorical(df['token'], categories=list(labels),
-                                 ordered=True)
-    color_map = {name: c for name, c in zip(labels, colors)}
-
-    default_title = ('g(·|t) comparison: ' + ',  '.join(ess_tags))
-    p = (
-        pn.ggplot(df, pn.aes('x', 'y'))
-        + pn.facet_wrap('~pc_pair', scales='free')
-        + pn.coord_cartesian(expand=False)
-        + pn.theme_minimal()
-        + pn.labs(x=None, y=None, title=title or default_title,
-                  fill='token')
-        + pn.scale_fill_manual(values=color_map)
+    senses_df = (_senses_dataframe(senses, V_cols, pairs, center=center,
+                                   pc_pair_labels=pc_pair_labels)
+                 if senses is not None else None)
+    ex_long = (_examples_long_df(examples, pairs, V_basis=V_cols, center=center,
+                                 pc_pair_labels=pc_pair_labels)
+               if examples is not None else None)
+    pn, pd, _ = _require_plotnine()
+    colors = ['#1f77b4']
+    levels = ((0.2, 0.15), (0.5, 0.25), (0.8, 0.4))
+    return _filled_bands_plot(
+        df,
+        title=title or default_title,
+        labels=[label],
+        colors=colors,
+        levels=levels,
+        senses_df=senses_df,
+        examples_df=ex_long,
     )
-    # Stacked translucent bands per token. Drawn in ascending-threshold
-    # order so cores render on top of halos.
-    for level, alpha in sorted(levels, key=lambda la: la[0]):
-        band = df[df['density'] > level]
-        if len(band) == 0:
-            continue
-        p = p + pn.geom_tile(
-            band,
-            pn.aes('x', 'y', fill='token'),
-            alpha=alpha, inherit_aes=False,
-        )
-    return p
 
 
 def suggest_contrast_axes(
@@ -1384,35 +1411,21 @@ def suggest_contrast_axes(
         viz_sample: VizSample.
         W: (V, d) tensor or array — `model.lm_head.weight`.
         weights: (N,) optional non-negative importance weights for the PCA.
-            None → unweighted (a centered marginal basis). For token-specific
-            axes, pass the output of `token_weights()`; you'll get the PCA
-            of g(·|t) plus the contrasts that explain it.
+            None → unweighted (marginal basis). For token-specific axes,
+            pass the output of `token_weights()`.
         k_pc: number of leading PCs to explain.
         top_n: how many candidate contrasts to return per PC, ranked by score.
-        score: 'cosine' (default) maximises cos(W[pos]−W[neg], v_k) — the
-            contrast vector points most exactly along the PC. 'projection'
-            maximises (W[pos]−W[neg])·v_k — the contrast spreads tokens most
-            along the PC (cheap, but biased toward high-norm W rows).
-        candidate_pool: for score='cosine', how many top/bottom tokens (by
-            v_k projection) to enumerate exhaustively. Searching all V² pairs
-            is infeasible for realistic vocabularies; restricting to the
-            extremes preserves nearly all of the alignment mass. Ignored
-            when score='projection'.
-        restrict_to: optional iterable of token ids to consider — useful for
-            filtering out rare or junk tokens
-            (e.g. `np.flatnonzero(Z > 1e-5)`).
+        score: 'cosine' (default) or 'projection'.
+        candidate_pool: for score='cosine', top/bottom tokens (by v_k
+            projection) to enumerate exhaustively.
+        restrict_to: optional iterable of token ids to consider.
         decode: optional `list[int] -> str`; with verbose=True, prints
             suggestions with decoded strings.
         verbose: print a per-PC summary.
 
     Returns:
-        list[dict], one entry per PC with keys:
-          - 'pc' (int, 0-indexed)
-          - 'eigval' (float — variance along the PC)
-          - 'frac_var' (float — fraction of total variance)
-          - 'axes' — list of (pos_id, neg_id, score) triples, ranked
-        PC sign is arbitrary; (pos, neg) is oriented so the score is
-        positive, i.e. `pos` lies on the "+v_k" end.
+        list[dict], one entry per PC with keys: 'pc', 'eigval', 'frac_var',
+        'axes' — list of (pos_id, neg_id, score) triples, ranked.
     """
     H = np.asarray(viz_sample.H, dtype=np.float32)
     if weights is None:
@@ -1524,8 +1537,8 @@ def axes_from_suggestions(suggestions, pc_pairs=((0, 1), (2, 3), (4, 5)),
         suggestions = suggest_contrast_axes(vs, W, weights=omega, k_pc=6)
         axes = axes_from_suggestions(suggestions,
                                      pc_pairs=((0, 1), (2, 3), (4, 5)))
-        plot_token_density(vs, W, t, Z[t], basis='contrast',
-                           axes=axes, decode=decode)
+        plot_density(vs, W, Z, 'bank', stoi=stoi,
+                     basis='contrast', axes=axes, decode=decode)
     """
     axes = []
     for (pi, pj) in pc_pairs:
@@ -1548,9 +1561,10 @@ def axes_from_suggestions(suggestions, pc_pairs=((0, 1), (2, 3), (4, 5)),
 
 
 def _check_pcs(pcs, k_pc):
-    for (pi, pj) in pcs:
-        if pi >= k_pc or pj >= k_pc:
+    """Raise if any PC index in pcs >= k_pc (the cached number of PCs)."""
+    for pi in pcs:
+        if pi >= k_pc:
             raise ValueError(
-                f"PC pair ({pi}, {pj}) exceeds cached k_pc={k_pc}. "
+                f"PC index {pi} exceeds cached k_pc={k_pc}. "
                 f"Re-cache with a larger k_pc, or request lower PCs."
             )

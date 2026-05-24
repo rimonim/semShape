@@ -78,7 +78,6 @@ def test_cache_and_load_roundtrip():
         assert vs.projections.shape == (N, 3)
         assert vs.row_index.shape == (N,)
         assert vs.row_index.dtype == np.int64
-        # Subsample without replacement — all indices unique, in [0, n_valid)
         assert len(np.unique(vs.row_index)) == N
         assert vs.row_index.min() >= 0 and vs.row_index.max() < 1200
         assert np.all(np.isfinite(vs.H))
@@ -111,14 +110,13 @@ def test_svd_deferred_by_default_and_lazy_on_global_plot():
             N=80, k_pc=3,
             logsumexp_batch_size=32, device='cpu', verbose=False,
         )
-        # Default: SVD deferred, empty arrays for V_basis/S/projections.
         assert not vs.has_svd
         assert vs.V_basis.size == 0 and vs.projections.size == 0
         assert vs.meta['svd_computed'] is False
 
-        # Calling plot_global_density triggers lazy computation.
         from shape.viz import plot_global_density
-        plot_global_density(vs, pcs=((0, 1),))
+        # pcs is now a list of ints; matrix layout
+        plot_global_density(vs, pcs=[0, 1])
         assert vs.has_svd
         assert vs.V_basis.shape == (d, d)
 
@@ -195,7 +193,6 @@ def test_svd_basis_is_orthonormal_and_projections_consistent():
         expected_proj = vs.H @ vs.V_basis[:, :d]
         np.testing.assert_allclose(vs.projections, expected_proj, atol=1e-4)
 
-        # Singular values are non-increasing
         assert np.all(np.diff(vs.S) <= 1e-6)
 
 
@@ -216,17 +213,14 @@ def test_token_weights_match_explicit_softmax():
 
         t = 3
         Z_t = 0.25
-        # Explicit per-sample p_t(h) / Z_t
         H_t = torch.from_numpy(vs.H)
         logits = H_t @ W.T
         p = torch.softmax(logits, dim=-1)
         expected = (p[:, t] / Z_t).numpy()
 
-        # Un-stabilized — should match exactly (up to float precision)
         omega = token_weights(vs, W, t, Z_t, stabilize=False)
         np.testing.assert_allclose(omega, expected, rtol=1e-4, atol=1e-5)
 
-        # Stabilized differs only by a positive scalar (same shape)
         omega_stab = token_weights(vs, W, t, Z_t, stabilize=True)
         ratio = omega_stab / (expected + 1e-30)
         np.testing.assert_allclose(ratio, ratio[0] * np.ones_like(ratio),
@@ -253,18 +247,17 @@ def test_token_weights_rejects_nonpositive_Z():
 def test_ess_bounded_by_N():
     w = np.ones(100, dtype=np.float32)
     assert abs(effective_sample_size(w) - 100.0) < 1e-4
-    # Spike-y weights → small ESS
     w2 = np.zeros(100, dtype=np.float32)
     w2[0] = 1.0
     assert effective_sample_size(w2) == 1.0
 
 
-def test_plot_functions_build_ggplot():
-    """Smoke-test that plotting returns a plotnine.ggplot — skipped if not installed."""
+def test_plot_density_builds_ggplot():
+    """Smoke-test that plot_density returns a plotnine.ggplot."""
     try:
         import plotnine  # noqa: F401
     except ImportError:
-        return  # silently skip
+        return
 
     d = 4
     V = 8
@@ -277,20 +270,89 @@ def test_plot_functions_build_ggplot():
             logsumexp_batch_size=32, device='cpu', verbose=False,
         )
 
-        from shape.viz import plot_global_density, plot_token_density
+        from shape.viz import plot_density, plot_global_density
         import plotnine as pn
-        pcs = ((0, 1), (2, 3))
+
+        Z = np.full(V, 1.0 / V, dtype=np.float32)
+        pcs = [0, 1]
 
         g = plot_global_density(vs, pcs=pcs)
         assert isinstance(g, pn.ggplot)
 
-        t = plot_token_density(vs, W, 2, 0.1, pcs=pcs, token_label='x')
+        # Single token — int id
+        t = plot_density(vs, W, Z, 2, pcs=pcs)
         assert isinstance(t, pn.ggplot)
 
-        # senses overlay
+        # senses overlay (single token only)
         senses = np.random.RandomState(0).randn(2, d).astype(np.float32)
-        t2 = plot_token_density(vs, W, 2, 0.1, pcs=pcs, senses=senses)
+        t2 = plot_density(vs, W, Z, 2, pcs=pcs, senses=senses)
         assert isinstance(t2, pn.ggplot)
+
+        # Multi-token — list of ints, basis='global' auto-selected
+        t3 = plot_density(vs, W, Z, [1, 3], pcs=pcs, n_grid=20)
+        assert isinstance(t3, pn.ggplot)
+
+
+def test_plot_density_string_tokens():
+    """plot_density accepts string tokens via stoi."""
+    try:
+        import plotnine  # noqa: F401
+    except ImportError:
+        return
+
+    d = 4
+    V = 8
+    with tempfile.TemporaryDirectory() as td:
+        _make_fake_extract(td, d=d, n_valid=600, V=V, seed=30)
+        W = torch.randn(V, d) * 0.3
+        vs = build_viz_sample(
+            td, 'toy', W, os.path.join(td, 'viz.npz'),
+            N=80, k_pc=3,
+            logsumexp_batch_size=32, device='cpu', verbose=False,
+        )
+        from shape.viz import plot_density
+        import plotnine as pn
+
+        Z = np.full(V, 1.0 / V, dtype=np.float32)
+        stoi = {str(i): i for i in range(V)}
+        p = plot_density(vs, W, Z, '2', stoi=stoi, pcs=[0, 1], n_grid=20)
+        assert isinstance(p, pn.ggplot)
+
+        # Missing stoi for string token should raise
+        try:
+            plot_density(vs, W, Z, 'hello', pcs=[0, 1])
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("expected ValueError when stoi is missing")
+
+
+def test_plot_density_multi_token_rejects_token_basis():
+    """basis='token' raises for multi-token calls."""
+    try:
+        import plotnine  # noqa: F401
+    except ImportError:
+        return
+
+    d = 4
+    V = 6
+    with tempfile.TemporaryDirectory() as td:
+        _make_fake_extract(td, d=d, n_valid=400, V=V, seed=21)
+        W = torch.randn(V, d) * 0.3
+        vs = build_viz_sample(
+            td, 'toy', W, os.path.join(td, 'viz.npz'),
+            N=80, k_pc=3,
+            logsumexp_batch_size=32, device='cpu', verbose=False,
+        )
+        from shape.viz import plot_density
+
+        Z = np.full(V, 1.0 / V, dtype=np.float32)
+        try:
+            plot_density(vs, W, Z, [1, 3], basis='token', pcs=[0, 1], n_grid=20)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("expected ValueError for basis='token' with multi-token")
 
 
 def test_plot_empirical_token_density_smoke():
@@ -310,79 +372,27 @@ def test_plot_empirical_token_density_smoke():
             logsumexp_batch_size=32, device='cpu', verbose=False,
         )
 
-        from shape.viz import plot_empirical_token_density
+        from shape.viz import _plot_empirical_token_density
         import plotnine as pn
-        pcs = ((0, 1), (2, 3))
+        pcs = [0, 1]
 
-        # Pick a t that definitely appears as next-token somewhere
         next_tok = data[meta['min_context'] + 1 : meta['corpus_length']]
         t_present = int(np.bincount(next_tok.astype(np.int64),
                                     minlength=V).argmax())
 
-        p = plot_empirical_token_density(
+        p = _plot_empirical_token_density(
             vs, W, t_present, meta, data, H,
             pcs=pcs, basis='token', max_samples=64,
             rng=np.random.default_rng(0),
         )
         assert isinstance(p, pn.ggplot)
 
-        p_global = plot_empirical_token_density(
+        p_global = _plot_empirical_token_density(
             vs, W, t_present, meta, data, H,
             pcs=pcs, basis='global', max_samples=64,
             rng=np.random.default_rng(0),
         )
         assert isinstance(p_global, pn.ggplot)
-
-
-def test_plot_token_comparison_builds_ggplot():
-    try:
-        import plotnine  # noqa: F401
-    except ImportError:
-        return
-
-    d = 4
-    V = 6
-    with tempfile.TemporaryDirectory() as td:
-        _make_fake_extract(td, d=d, n_valid=400, V=V, seed=21)
-        W = torch.randn(V, d) * 0.3
-        vs = build_viz_sample(
-            td, 'toy', W, os.path.join(td, 'viz.npz'),
-            N=80, k_pc=3,
-            logsumexp_batch_size=32, device='cpu', verbose=False,
-        )
-
-        from shape.viz import plot_token_comparison
-        import plotnine as pn
-
-        # Synthesize a plausible Z (uniform) and a couple of tokens.
-        Z = np.full(V, 1.0 / V, dtype=np.float32)
-        p = plot_token_comparison(
-            vs, W, Z, tokens=[1, 3],
-            labels=['a', 'b'],
-            pcs=((0, 1), (1, 2)),
-            basis='global',
-            n_grid=30,
-        )
-        assert isinstance(p, pn.ggplot)
-        # Global basis was absent before this call — should be lazy-cached now.
-        assert vs.has_svd
-
-        # basis='token' is rejected.
-        try:
-            plot_token_comparison(vs, W, Z, tokens=[1, 3],
-                                  basis='token', n_grid=30)
-        except ValueError:
-            pass
-        else:
-            raise AssertionError("expected ValueError for basis='token'")
-
-        # Single token is rejected.
-        try:
-            plot_token_comparison(vs, W, Z, tokens=[1], n_grid=30)
-        except ValueError:
-            pass
-        else:
-            raise AssertionError("expected ValueError for single token")
 
 
 def test_plot_empirical_token_density_raises_when_token_absent():
@@ -401,14 +411,13 @@ def test_plot_empirical_token_density_raises_when_token_absent():
             N=40, k_pc=3,
             logsumexp_batch_size=32, device='cpu', verbose=False,
         )
-        from shape.viz import plot_empirical_token_density
+        from shape.viz import _plot_empirical_token_density
 
-        # Force an id that can't appear as a next-token (V is small, so use V+5)
         absent = V + 5
         try:
-            plot_empirical_token_density(
+            _plot_empirical_token_density(
                 vs, W, absent, meta, data, H,
-                pcs=((0, 1),), max_samples=32,
+                pcs=[0, 1], max_samples=32,
             )
         except ValueError:
             pass
@@ -447,24 +456,20 @@ def test_sample_token_instances_finds_next_token_positions():
             rng=np.random.default_rng(1),
         )
 
-        # Wide form: one row per instance; projection columns for every PC
         k_returned = len(df)
         assert k_returned <= 5
         assert k_returned == df['row_index'].nunique()
         for p in range(vs.k_pc):
             assert f'pc{p + 1}' in df.columns
 
-        # Every sampled corpus position has next-token == t_target
         for pos in df['corpus_pos']:
             assert int(data[pos + 1]) == t_target
 
-        # Label ends with the target token (comma-separated), length == context
         for _, row in df.iterrows():
             ids = [int(x) for x in row['label'].split(',')]
             assert ids[-1] == t_target
             assert len(ids) == 6
 
-        # Projections: pc1 should equal h_eff[row_index] @ V_basis[:, 0]
         V_basis = vs.V_basis[:, :vs.k_pc]
         for _, row in df.iterrows():
             expected = float(h_eff[int(row['row_index'])] @ V_basis[:, 0])
@@ -535,7 +540,7 @@ def test_load_decode_char_meta_pickle():
         with open(os.path.join(td, ds, 'meta.pkl'), 'wb') as f:
             pickle.dump({'stoi': stoi, 'itos': itos, 'vocab_size': 3}, f)
         decode = load_decode(ds, data_dir=td)
-        assert decode([0, 1, 2, 0]) == 'abca'
+        assert decode([0, 1, 2, 0]) == 'a b c a'
 
 
 def test_plot_functions_accept_examples_overlay():
@@ -560,20 +565,59 @@ def test_plot_functions_accept_examples_overlay():
                 'window': 0, 'min_context': 4}
         h_eff = np.random.default_rng(0).standard_normal((T - 4, d)).astype(np.float32)
 
-        pcs = ((0, 1), (2, 3))
+        pcs = [0, 1]
         ex = sample_token_instances(vs, meta, data, h_eff,
                                     t=None, k=3, context=4,
                                     rng=np.random.default_rng(0))
 
-        from shape.viz import plot_global_density, plot_token_density
+        from shape.viz import plot_density, plot_global_density
         import plotnine as pn
 
         g = plot_global_density(vs, pcs=pcs, examples=ex)
         assert isinstance(g, pn.ggplot)
 
-        t = plot_token_density(vs, W, 2, 0.1, pcs=pcs,
-                               token_label='x', examples=ex)
+        Z = np.full(V, 1.0 / V, dtype=np.float32)
+        t = plot_density(vs, W, Z, 2, pcs=pcs, examples=ex, n_grid=20)
         assert isinstance(t, pn.ggplot)
+
+
+def test_plot_density_int_examples():
+    """examples=k (int) triggers random sampling via corpus_context."""
+    try:
+        import plotnine  # noqa: F401
+    except ImportError:
+        return
+
+    d = 4
+    V = 8
+    with tempfile.TemporaryDirectory() as td:
+        H, data, meta = _make_fake_extract(td, d=d, n_valid=600, V=V, seed=40)
+        W = torch.randn(V, d) * 0.3
+        vs = build_viz_sample(
+            td, 'toy', W, os.path.join(td, 'viz.npz'),
+            N=80, k_pc=3,
+            logsumexp_batch_size=32, device='cpu', verbose=False,
+        )
+        from shape.viz import plot_density, CorpusContext
+        import plotnine as pn
+
+        Z = np.full(V, 1.0 / V, dtype=np.float32)
+        # Pick a token that appears as next-token in the corpus
+        next_tok = data[meta['min_context'] + 1:]
+        t_present = int(np.bincount(next_tok.astype(np.int64), minlength=V).argmax())
+        cc = CorpusContext(data=data, h_eff=H, extract_meta=meta)
+
+        p = plot_density(vs, W, Z, t_present, pcs=[0, 1],
+                         examples=3, corpus_context=cc, n_grid=20)
+        assert isinstance(p, pn.ggplot)
+
+        # examples=int without corpus_context should raise
+        try:
+            plot_density(vs, W, Z, t_present, pcs=[0, 1], examples=3)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("expected ValueError when corpus_context is missing")
 
 
 if __name__ == '__main__':
