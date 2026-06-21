@@ -958,6 +958,11 @@ def _filled_bands_plot(df, *, title, labels, colors, levels,
 
 
 def plot_global_density(viz_sample, pcs=(0, 1, 2, 3),
+                        basis='global',
+                        W=None,
+                        weights=None,
+                        axes=None,
+                        decode=None,
                         n_grid=80, bw_method=None,
                         title='Global density g(·)',
                         examples=None):
@@ -967,21 +972,31 @@ def plot_global_density(viz_sample, pcs=(0, 1, 2, 3),
     pcs: list of PC indices. All non-diagonal (i, j) combinations are shown
     in a matrix layout — columns share the x-axis PC, rows share the y-axis PC.
 
+    basis: 'global' (default) uses the cached uncentered SVD. 'token' uses a
+    weighted (or unweighted when weights=None) centered PCA — pass the omega
+    array from token_weights() as `weights` to visualise g(·) on the same axes
+    as a plot_density call for that token. 'contrast' uses token-pair log-odds
+    axes; requires W and axes (same format as plot_density).
+
+    W: (V, d) weight matrix — required for basis='contrast'.
+    weights: (N,) importance weights — only consulted when basis='token';
+    passing the omega from token_weights() places g(·) on the token-PCA axes.
+    axes: list of ((pos, neg), (pos, neg)) contrast specs — required for
+    basis='contrast'. Same format as plot_density.
+    decode: optional list[int]→str for contrast axis labels.
+
     examples: optional DataFrame from `sample_token_instances` (pass t=None
     there for random corpus positions).
     """
-    _ensure_svd(viz_sample, verbose=False)
-    pcs = list(pcs)
-    _check_pcs(pcs, viz_sample.k_pc)
-    max_pc = max(pcs) + 1
-    V_cols = viz_sample.V_basis[:, :max_pc]
-    projections = (viz_sample.H @ V_cols).astype(np.float32)
-    pairs = [(i, j) for i in pcs for j in pcs if i != j]
-    pc_pair_labels = _default_axis_labels(pairs, basis='global')
+    H_np = np.asarray(viz_sample.H, dtype=np.float32)
+    projections, V_cols, center, pairs, pc_pair_labels = _dispatch_basis(
+        H_np, weights, viz_sample, W,
+        basis=basis, pcs=list(pcs), axes=axes, decode=decode,
+    )
     df = _weighted_kde_long_df(projections, pairs, weights=None,
                                n_grid=n_grid, bw_method=bw_method,
                                pc_pair_labels=pc_pair_labels)
-    ex_long = (_examples_long_df(examples, pairs, V_basis=V_cols, center=None,
+    ex_long = (_examples_long_df(examples, pairs, V_basis=V_cols, center=center,
                                  pc_pair_labels=pc_pair_labels)
                if examples is not None else None)
     return _density_plot(df, title=title, examples_df=ex_long)
