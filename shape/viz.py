@@ -11,19 +11,16 @@ An uncentered SVD (V_basis, S, projections) is only required by the global
 basis path; it is deferred by default and computed lazily on first use.
 Pass `compute_svd=True` to `build_viz_sample` if you want it up-front.
 
-Public plotting API (three functions):
+Public plotting API (two functions):
 
-  plot_global_density(viz_sample, pcs, ...)
-      Heatmap of the unconditional empirical density g(·). pcs is a list of
-      PC indices; all non-diagonal (i, j) pairs are shown in a matrix layout
-      with columns sharing the x-axis and rows sharing the y-axis.
-
-  plot_density(viz_sample, W, Z, tokens, *, ...)
-      Filled-bands overlay of g(·|t) for one or more tokens. Single token →
-      basis='token' (per-token centered PCA) by default; multiple tokens →
-      basis='global'. Accepts token ids (int) or strings (str, requires stoi).
-      Z is the full (V,) marginals array. examples can be a DataFrame, an int
-      k (random corpus sample), or a list of phrase strings to search for.
+  plot_density(viz_sample, W=None, Z=None, tokens=None, *, ...)
+      Without tokens: heatmap of the unconditional empirical density g(·),
+      defaulting to basis='global'. With tokens: filled-bands overlay of
+      g(·|t) for one or more tokens (single token defaults to basis='token',
+      multiple tokens default to basis='global'). Accepts token ids (int) or
+      strings (str, requires stoi). Z is the full (V,) marginals array.
+      examples can be a DataFrame, an int k (random corpus sample), or a list
+      of phrase strings to search for.
 
   plot_distinctiveness(viz_sample, W, Z, token, *, ...)
       Diverging log-ratio heatmap D_t(y) = log[g(y|t)/g(y)] for a single
@@ -957,35 +954,6 @@ def _filled_bands_plot(df, *, title, labels, colors, levels,
     return p
 
 
-def plot_global_density(viz_sample, pcs=(0, 1, 2, 3),
-                        n_grid=80, bw_method=None,
-                        title='Global density g(·)',
-                        examples=None):
-    """
-    Faceted heatmap of the unconditional empirical density g(·).
-
-    pcs: list of PC indices. All non-diagonal (i, j) combinations are shown
-    in a matrix layout — columns share the x-axis PC, rows share the y-axis PC.
-
-    examples: optional DataFrame from `sample_token_instances` (pass t=None
-    there for random corpus positions).
-    """
-    _ensure_svd(viz_sample, verbose=False)
-    pcs = list(pcs)
-    _check_pcs(pcs, viz_sample.k_pc)
-    max_pc = max(pcs) + 1
-    V_cols = viz_sample.V_basis[:, :max_pc]
-    projections = (viz_sample.H @ V_cols).astype(np.float32)
-    pairs = [(i, j) for i in pcs for j in pcs if i != j]
-    pc_pair_labels = _default_axis_labels(pairs, basis='global')
-    df = _weighted_kde_long_df(projections, pairs, weights=None,
-                               n_grid=n_grid, bw_method=bw_method,
-                               pc_pair_labels=pc_pair_labels)
-    ex_long = (_examples_long_df(examples, pairs, V_basis=V_cols, center=None,
-                                 pc_pair_labels=pc_pair_labels)
-               if examples is not None else None)
-    return _density_plot(df, title=title, examples_df=ex_long)
-
 
 def _contrast_basis(W, axes, decode=None):
     """
@@ -1130,7 +1098,7 @@ def _resolve_tokens(tokens_input, Z, stoi=None):
     return ids, labels
 
 
-def plot_density(viz_sample, W, Z, tokens, *,
+def plot_density(viz_sample, W=None, Z=None, tokens=None, *,
                  stoi=None,
                  labels=None,
                  pcs=(0, 1, 2, 3),
@@ -1147,31 +1115,78 @@ def plot_density(viz_sample, W, Z, tokens, *,
                  corpus_context=None,
                  phrase_avg=1):
     """
-    Filled-bands overlay of token-conditional density g(·|t) for one or more
-    tokens. Each token is drawn as stacked translucent bands; darker core,
-    lighter halo. Works for 1 to N tokens on a shared basis.
+    Density plot dispatcher.
 
-    pcs: list of PC indices. All non-diagonal (i, j) pairs are shown in a
-    matrix layout (columns = x-axis PC, rows = y-axis PC). Default: [0,1,2,3].
+    Without tokens (tokens=None): heatmap of the unconditional empirical
+    density g(·). basis defaults to 'global'; W is only needed for
+    basis='contrast'. examples may be an int k (random corpus sample),
+    a DataFrame, or a list of phrase strings.
 
-    tokens: int | str | list[int | str]. String tokens require `stoi`.
-    Z: full (V,) marginals array (no need to extract Z_t per token).
+    With tokens: filled-bands overlay of g(·|t) for one or more tokens.
+    Each token is drawn as stacked translucent bands; darker core, lighter
+    halo. W and Z are required. tokens: int | str | list[int | str]; string
+    tokens require stoi. Z: full (V,) marginals array. basis defaults to
+    'token' for a single token and 'global' for multiple tokens.
 
-    basis: 'token' (default for single token) uses a weighted centered PCA —
-    axes show the principal polysemy directions for that token, non-comparable
-    across tokens. 'global' uses the cached uncentered SVD (shared axes across
-    tokens). 'contrast' uses token-pair log-odds axes (see `axes`). For
-    multiple tokens, basis defaults to 'global'.
+    pcs: list of PC indices — all non-diagonal (i, j) pairs shown in a
+    matrix layout (columns = x PC, rows = y PC). Default: [0,1,2,3].
 
-    examples: None | int k (random corpus sample, single-token only) |
-    list[str] (phrase search — first occurrence or average of phrase_avg
-    occurrences) | DataFrame from sample_token_instances.
+    basis: 'token' (weighted centered PCA, per-token axes), 'global'
+    (cached uncentered SVD, shared axes), or 'contrast' (token-pair
+    log-odds axes; requires axes kwarg).
+
+    examples: None | int k (random corpus sample, single-token only when
+    tokens provided) | list[str] (phrase search, first occurrence or average
+    of phrase_avg occurrences) | DataFrame from sample_token_instances.
     corpus_context: CorpusContext, required when examples is int or list[str].
     phrase_avg: 1 = first corpus occurrence; N>1 = average N occurrences.
 
-    senses: optional (K, d) array of sense centroids overlaid as red points
-    (single-token only; silently ignored for multi-token).
+    senses: optional (K, d) array of sense centroids overlaid as red points.
+    For token plots, silently ignored when multiple tokens are given.
     """
+    H_np = np.asarray(viz_sample.H, dtype=np.float32)
+    pcs_list = list(pcs)
+
+    # ── global density path ───────────────────────────────────────────────────
+    if tokens is None:
+        if basis is None:
+            basis = 'global'
+        projections, V_cols, center, pairs, pc_pair_labels = _dispatch_basis(
+            H_np, None, viz_sample, W,
+            basis=basis, pcs=pcs_list, axes=axes, decode=decode,
+        )
+        df = _weighted_kde_long_df(projections, pairs, weights=None,
+                                   n_grid=n_grid, bw_method=bw_method,
+                                   pc_pair_labels=pc_pair_labels)
+        ex_df = None
+        if examples is not None:
+            if isinstance(examples, int):
+                if corpus_context is None:
+                    raise ValueError(
+                        "corpus_context is required when examples is an int."
+                    )
+                ex_df = sample_token_instances(
+                    viz_sample, corpus_context.extract_meta,
+                    corpus_context.data, corpus_context.h_eff,
+                    t=None, k=examples, decode=decode,
+                )
+            else:
+                ex_df = _resolve_examples(examples, [], viz_sample,
+                                          corpus_context, stoi, decode,
+                                          phrase_avg)
+        ex_long = (_examples_long_df(ex_df, pairs, V_basis=V_cols, center=center,
+                                     pc_pair_labels=pc_pair_labels)
+                   if ex_df is not None else None)
+        senses_df = (_senses_dataframe(senses, V_cols, pairs, center=center,
+                                       pc_pair_labels=pc_pair_labels)
+                     if senses is not None else None)
+        return _density_plot(df, title=title or 'Global density g(·)',
+                             senses_df=senses_df, examples_df=ex_long)
+
+    # ── token-conditional density path ───────────────────────────────────────
+    if W is None or Z is None:
+        raise ValueError("W and Z are required when tokens are specified.")
+
     Z_arr = np.asarray(Z)
     ids, auto_labels = _resolve_tokens(tokens, Z_arr, stoi=stoi)
     if labels is None:
@@ -1194,7 +1209,6 @@ def plot_density(viz_sample, W, Z, tokens, *,
     if len(colors) != len(ids):
         raise ValueError("len(colors) must equal len(tokens).")
 
-    # Per-token weights and ESS
     weight_specs = []
     ess_tags = []
     for t, lbl in zip(ids, labels):
@@ -1202,11 +1216,7 @@ def plot_density(viz_sample, W, Z, tokens, *,
         weight_specs.append((lbl, omega))
         ess_tags.append(f"{lbl}: ESS={effective_sample_size(omega):.0f}")
 
-    H_np = np.asarray(viz_sample.H, dtype=np.float32)
-    pcs_list = list(pcs)
-
     if basis == 'token':
-        # Build basis from the single token's weights
         _, omega_0 = weight_specs[0]
         projections, V_cols, center, pairs, pc_pair_labels = _dispatch_basis(
             H_np, omega_0, viz_sample, W,
