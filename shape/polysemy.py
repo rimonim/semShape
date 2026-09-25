@@ -604,7 +604,7 @@ def sense_examples(
     """Top-N corpus instances per sense, with decoded surrounding text.
 
     Each sense k has soft assignments r_{ik} from the EM fit. We rank cached
-    h_eff samples by a per-sense score and decode `±context` tokens of corpus
+    h samples by a per-sense score and decode `±context` tokens of corpus
     text around each chosen position.
 
     Args:

@@ -1,7 +1,9 @@
 """
-Stage 1 CLI: corpus pass → h_eff + Z.
+Stage 1 CLI: corpus pass → sampled predictive states + Z.
 
-Wraps shape.extract.extract_features. Designed for fast iteration over window
+Wraps shape.extract.extract_features. Writes {dataset}_h.npy (hidden states;
+no window or --averaging aitchison) or {dataset}_probs.npy (probability-space
+window averages; --averaging probability). Designed for fast iteration over window
 size and shape; all windowing knobs are first-class arguments.
 
 Example (single-position, COCA test split):
@@ -18,6 +20,15 @@ Example (symmetric window-5, harmonic decay):
         --out-dir features/coca \\
         --dataset coca_test_w5_harm \\
         --window 5 --weights harmonic --direction symmetric
+
+Example (short forward window, averaged in probability space):
+    python scripts/extract_features.py \\
+        --ckpt out-coca/ckpt.pt \\
+        --data data/coca/val.bin \\
+        --out-dir features/coca \\
+        --dataset coca_val_short_forward \\
+        --window 10 --weights exponential --weights-alpha 0.69 \\
+        --direction forward --averaging probability
 """
 
 import argparse
@@ -37,7 +48,7 @@ from shape.extract import extract_features
 
 
 def parse_args():
-    p = argparse.ArgumentParser(description="Stage 1: extract h_eff and Z from a trained GPT.")
+    p = argparse.ArgumentParser(description="Stage 1: sample predictive states and Z from a trained GPT.")
 
     # Required
     p.add_argument("--ckpt", required=True, help="Path to checkpoint .pt file.")
@@ -48,7 +59,7 @@ def parse_args():
 
     # Windowing (the main iteration axis)
     p.add_argument("--window", type=int, default=0,
-                   help="Half-window size for Variant-H averaging. 0 = single position.")
+                   help="Half-window size for averaging. 0 = single position.")
     p.add_argument("--weights", default="linear",
                    choices=["linear", "harmonic", "exponential", "power", "none"],
                    help="Decay function for window weights (default: linear).")
@@ -60,21 +71,26 @@ def parse_args():
     p.add_argument("--no-include-target", dest="include_target", action="store_false",
                    help="Exclude the target position (d=0) from the window average.")
     p.set_defaults(include_target=True)
+    p.add_argument("--tokens-per-minute", type=float, default=None,
+                   help="Convert token distances to minutes before applying decay.")
+    p.add_argument("--averaging", default="aitchison", choices=["aitchison", "probability"],
+                   help="Window averaging geometry: 'aitchison' averages hidden states "
+                        "(compact (N, d) float32 output); 'probability' averages "
+                        "distributions ((N, V) float16 output). Default: aitchison.")
 
     # Geometry
-    p.add_argument("--no-project-degenerate", dest="project_degenerate",
-                   action="store_false",
-                   help="Keep the degenerate direction (skip projection onto complement).")
-    p.set_defaults(project_degenerate=True)
+    p.add_argument("--project-degenerate", action="store_true",
+                   help="Experimental: project hidden states off the degenerate "
+                        "direction v_degen (hidden-state outputs only).")
     p.add_argument("--min-context", type=int, default=32,
                    help="Minimum left-context tokens required per position (default: 32).")
 
     # Storage
-    p.add_argument("--no-save-h-eff", dest="save_h_eff", action="store_false",
-                   help="Skip writing the full (N, d) h_eff memmap (use with --save-subsample).")
-    p.set_defaults(save_h_eff=True)
+    p.add_argument("--no-save-states", dest="save_states", action="store_false",
+                   help="Skip writing the full sample memmap (use with --save-subsample).")
+    p.set_defaults(save_states=True)
     p.add_argument("--save-subsample", type=int, default=0,
-                   help="Reservoir-sample this many h_eff rows to disk (0 = skip).")
+                   help="Reservoir-sample this many hidden states to disk (0 = skip).")
 
     # Compute
     p.add_argument("--batch-size", type=int, default=128,
@@ -122,12 +138,14 @@ def main():
         weights_alpha=args.weights_alpha,
         direction=args.direction,
         include_target=args.include_target,
+        tokens_per_minute=args.tokens_per_minute,
+        averaging=args.averaging,
         min_context=args.min_context,
         project_degenerate=args.project_degenerate,
         batch_size=args.batch_size,
         device=device,
         compute_dtype=args.compute_dtype,
-        save_h_eff=args.save_h_eff,
+        save_states=args.save_states,
         save_subsample=args.save_subsample,
         seed=args.seed,
         checkpoint_path=args.ckpt,

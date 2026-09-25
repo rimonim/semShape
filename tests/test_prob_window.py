@@ -1,4 +1,4 @@
-"""Tests for shape.embeddings.compute_moment_matrix_prob_window."""
+"""Tests for shape.embeddings.compute_moment_matrix_streaming and stored-probs moments."""
 
 import os
 import sys
@@ -12,7 +12,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from model import GPT, GPTConfig
 from shape.embeddings import (
     compute_moment_matrix,
-    compute_moment_matrix_prob_window,
+    compute_moment_matrix_streaming,
 )
 from shape.extract import extract_features
 
@@ -26,7 +26,7 @@ def make_toy_model(V=8, d=4, L=32, n_layer=2, n_head=2, seed=0):
 
 def test_prob_window_window_zero_matches_compute_moment_matrix():
     """weights_lookup={0: 1.0} should reproduce compute_moment_matrix on the
-    h_eff extracted at window=0 (modulo FP rounding)."""
+    h extracted at window=0 (modulo FP rounding)."""
     V, d, L, T = 8, 4, 32, 300
     model = make_toy_model(V=V, d=d, L=L)
     data = np.random.RandomState(42).randint(0, V, size=T, dtype=np.uint16)
@@ -39,14 +39,14 @@ def test_prob_window_window_zero_matches_compute_moment_matrix():
             project_degenerate=False, batch_size=4,
             device='cpu', compute_dtype='float32', verbose=False,
         )
-        h_eff = np.load(os.path.join(td, 'toy_h_eff.npy'), mmap_mode='r')
+        h = np.load(os.path.join(td, 'toy_h.npy'), mmap_mode='r')
 
         ref = compute_moment_matrix(
-            h_eff, model.lm_head.weight,
+            h, model.lm_head.weight,
             batch_size=64, device='cpu', verbose=False,
         )
 
-    out = compute_moment_matrix_prob_window(
+    out = compute_moment_matrix_streaming(
         model, data, weights_lookup={0: 1.0},
         block_size=L, min_context=4, batch_size=4,
         device='cpu', compute_dtype='float32', verbose=False,
@@ -70,8 +70,9 @@ def test_prob_window_differs_from_h_window():
     alpha = math.log(2.0)
     weights_lookup = {-1: 0.5, 0: 1.0, 1: 0.5}
 
-    prob_out = compute_moment_matrix_prob_window(
+    prob_out = compute_moment_matrix_streaming(
         model, data, weights_lookup=weights_lookup,
+        averaging='probability',
         block_size=L, min_context=4, batch_size=4,
         device='cpu', compute_dtype='float32', verbose=False,
     )
@@ -87,9 +88,9 @@ def test_prob_window_differs_from_h_window():
             batch_size=4, device='cpu',
             compute_dtype='float32', verbose=False,
         )
-        h_eff = np.load(os.path.join(td, 'toy_h_eff.npy'), mmap_mode='r')
+        h = np.load(os.path.join(td, 'toy_h.npy'), mmap_mode='r')
         h_out = compute_moment_matrix(
-            h_eff, model.lm_head.weight,
+            h, model.lm_head.weight,
             batch_size=64, device='cpu', verbose=False,
         )
 

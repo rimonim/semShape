@@ -1,12 +1,11 @@
 """
-Weight-decay functions for window averaging. Shared between the continuous
-Variant-H pipeline (shape.extract) and the discrete FCM pipeline (discrete/build_fcm).
+Weight-decay functions for window averaging. 
 
 All decay functions return 1.0 at dist=0. Decay formulas for dist >= 1:
   linear:      (window_size - dist) / window_size  (reaches 0 at dist == window_size)
   harmonic:    1 / dist
   exponential: exp(-alpha * dist)
-  power:       (1 + dist) ** (-alpha)              (Averell & Heathcote 2011 form)
+  power:       (1 + dist) ** (-alpha)
   none:        1.0
 """
 
@@ -19,21 +18,26 @@ def calculate_weight(dist, window_size, decay_type, alpha=1.0, tokens_per_minute
     Returns 1.0 at dist=0 and 0.0 if dist > window_size.
 
     tokens_per_minute: if provided, converts token distance to minutes before
-        applying power decay: d_minutes = dist / tokens_per_minute,
-        weight = (1 + d_minutes) ** (-alpha). Ignored for other decay types.
+        applying the decay function: d_minutes = dist / tokens_per_minute
+        (e.g. power: weight = (1 + d_minutes) ** (-alpha)). window_size stays
+        in tokens; for linear decay both are converted, so it is unaffected.
+        Harmonic decay is normalized by its weight at dist=1 so it never
+        exceeds 1, which also makes it unaffected.
     """
     if dist > window_size:
         return 0.0
     if dist == 0:
         return 1.0
+    scale = tokens_per_minute if tokens_per_minute is not None else 1.0
+    d_eff = dist / scale
     if decay_type == 'linear':
         return max(0.0, (window_size - dist) / window_size)
     elif decay_type == 'harmonic':
+        # (1 / d_eff) / (1 / (1 / scale)) == 1 / dist
         return 1.0 / dist
     elif decay_type == 'exponential':
-        return math.exp(-alpha * dist)
+        return math.exp(-alpha * d_eff)
     elif decay_type == 'power':
-        d_eff = dist / tokens_per_minute if tokens_per_minute is not None else dist
         return (1.0 + d_eff) ** (-alpha)
     elif decay_type == 'none':
         return 1.0
@@ -55,8 +59,8 @@ def build_weight_lookup(window_size, decay_type, alpha=1.0,
       'backward'  - only d < 0
 
     tokens_per_minute: if provided, converts token distances to minutes before
-        applying power decay (d_minutes = |d| / tokens_per_minute). Ignored
-        for other decay types. Must be positive.
+        applying the decay function (d_minutes = |d| / tokens_per_minute).
+        Must be positive.
 
     Returns:
         dict mapping d -> weight (zero-weighted offsets omitted).

@@ -13,9 +13,9 @@ its vocabulary at every position. Each such distribution is a point on
 the probability simplex $Δ^{V−1}$ (since probability distributions are
 constrained to sum to 1, the simplex has one fewer dimension than the
 vocabulary $V$). The set of all those points, accumulated over a corpus,
-is a density $g(y)$ — a continuous object that captures the LLM’s
-distributional-semantic knowledge in full, not collapsed to per-token
-averages. The framework analyses this density and the per-token
+is a density $g(y)$ — a continuous object that captures the full range
+of the LLM’s distributional-semantic expressivity, without collapsing to
+per-token averages. semShape analyses this density and the per-token
 reweightings $g(y|t) ∝ p_t(y) · g(y)$ derived from it. This is
 interesting for a few reasons:
 
@@ -133,7 +133,7 @@ meanings that fall off it?
     scripts/               CLI wrappers around shape/ for each pipeline stage
     tests/                 pytest suite for shape/
     out-<dataset>/         training checkpoints (ckpt.pt + meta.pkl)
-    features/<dataset>/    Stage-1 outputs (h_eff, Z, meta)
+    features/<dataset>/    Stage-1 outputs (samples, Z, meta)
     models/<dataset>/      Stage-2 normalizing-flow checkpoints
     embeddings/            Stage-3 static-embedding .npz files
     train.py, model.py     LLM training (nanoGPT with rotary / RMSNorm / SwiGLU)
@@ -148,13 +148,15 @@ scripts that drive it.
 1.  **LLM Training**: `path/to/<dataset>/` → `train.py` →
     `out-\<dataset\>/ckpt.pt`
 2.  **Corpus Run**: `shape.extract.extract_features` →
-    `features/<dataset>/` (per-position $h$ or $h_⊥$)
+    `features/<dataset>/` (one predictive state per position, optionally
+    window-averaged: hidden states $h$, or probability vectors for
+    probability-space averaging)
 3.  **Visualization**: `shape.viz` → density plots
 4.  **Static Embeddings**: `shape.embeddings.compute_embeddings` →
     `embeddings/<dataset>/` (static embeddings analogous to word2vec) →
     `shape.embeddings_benchmarks`
 5.  **Global Density Estimation**: `shape.density.fit_flow` →
-    `models/<dataset>/` (Neural Spline Flow fit on $h$ or $h_⊥$)
+    `models/<dataset>/` (Neural Spline Flow fit on $h$)
 6.  **Distinctiveness Analysis**:
     `shape.distinctiveness.compute_distinctiveness` →
     `distinctiveness/<dataset>/` (distinctiveness scores)
@@ -168,13 +170,13 @@ CLI entry points (each is a thin wrapper around the corresponding
 python scripts/extract_features.py  --ckpt out-coca/ckpt.pt \
                                     --data path/to/coca/test.bin \
                                     --out-dir features/coca --dataset coca_test
-python scripts/fit_density.py       --h-eff features/coca/coca_test_h_eff.npy \
+python scripts/fit_density.py       --h features/coca/coca_test_h.npy \
                                     --out models/coca/coca_test_flow.pt
 python scripts/compute_embeddings.py --ckpt out-coca/ckpt.pt --features-dir features/coca \
                                     --dataset coca_test --out embeddings/coca_test_emb.npz
 python scripts/compute_similarity.py --ckpt out-coca/ckpt.pt \
                                     --vocab path/to/coca/meta.pkl \
-                                    --h-eff features/coca/coca_test_h_eff.npy \
+                                    --samples features/coca/coca_test_h.npy \
                                     --input pairs.csv --output pairs_with_sim.csv
 ```
 
@@ -186,28 +188,31 @@ baseline against which the continuous pipeline can be compared.
 
 | Module | Role |
 |----|----|
-| [`geometry.py`](shape/geometry.py) | ILR basis (Helmert SBP), `ILR_apply` / `ILR_apply_T`, `compute_A` (= ΨW), `degenerate_direction`, `project_h`. All cumsum-based — never materializes the (V−1)×V basis. |
+| [`geometry.py`](shape/geometry.py) | ILR basis (Helmert SBP), `ILR_apply` / `ILR_apply_T`, `compute_A` (= ΨW), and the experimental `degenerate_direction` / `project_h`. All cumsum-based — never materializes the (V−1)×V basis. |
 | [`windowing.py`](shape/windowing.py) | Decay-weight tables for context-window averaging (linear / harmonic / exponential / power), shared with the discrete FCM pipeline. Supports a `tokens_per_minute` parameter for converting token distances to elapsed time before applying power-law decay. |
-| [`extract.py`](shape/extract.py) | Stage 1. Streams the corpus through the LLM, emits per-position $h$ (or optionally $h_⊥$, with the $W^T\textbf{1}$ degenerate direction projected out) and the marginal $Z_w$. Supports memmapped output and reservoir subsampling for COCA-scale runs. |
-| [`density.py`](shape/density.py) | Stage 2. Fits a Zuko Neural Spline Flow on standardized $h$ or $h_⊥$ for $g̃(h)$; provides `log_density` and `sample`. |
-| [`embeddings.py`](shape/embeddings.py) | Stage 3. Moment matrix $M[t,w] = E[p_t·p_w] → PMI → optional\ Ψ → SVD → (V, k)$ embedding; plus `nearest_neighbors`. |
+| [`extract.py`](shape/extract.py) | Stage 1. Streams the corpus through the LLM and emits one predictive state per position plus the marginal $Z_w$. Window averages are taken either over hidden states (`averaging='aitchison'`, the default: the Aitchison centroid of the per-position distributions, stored compactly as $h̄ ∈ ℝ^d$) or over probabilities (`averaging='probability'`: the probability of each token within the window, stored as $V$-dimensional float16 vectors). `iter_window_states` exposes the same pass as a generator. Supports memmapped output and reservoir subsampling for COCA-scale runs. |
+| [`samples.py`](shape/samples.py) | Reads stored samples in either format: `iter_sample_probs` yields probability batches from hidden states (given $W$) or stored probabilities, so downstream estimators are format-agnostic. |
+| [`density.py`](shape/density.py) | Stage 2. Fits a Zuko Neural Spline Flow on standardized hidden states $h$ for $g̃(h)$; provides `log_density` and `sample`. |
+| [`embeddings.py`](shape/embeddings.py) | Stage 3. Moment matrix $M[t,w] = E[p_t·p_w] → PMI → optional\ Ψ → SVD → (V, k)$ embedding, from stored samples of either format or a streaming corpus pass; plus `nearest_neighbors`. |
 | [`embeddings_benchmarks.py`](shape/embeddings_benchmarks.py) | Psycholinguistic benchmark evaluation for static word embeddings. |
 | [`viz.py`](shape/viz.py) | Token-conditional density plots. Three bases: token-specific weighted PCA, global PCA, and user-specified token-pair contrasts (axes = log-odds of one token vs. another). Two views: model (importance-weighted) and empirical (filtered by next-token id). |
-| [`similarity.py`](shape/similarity.py) | Pairwise probability-theoretic similarity between token pairs: expected probability $E[p_{t_2} \mid t_1]$, expected surprisal $-E[\log p_{t_2} \mid t_1]$, and KL divergence $D_{KL}(g(\cdot\mid t_1)\Vert g(\cdot\mid t_2))$. All quantities are importance-weighted expectations; two entry points cover the h_eff-based (no windowing) and streaming prob-space-windowed corpus passes. |
+| [`similarity.py`](shape/similarity.py) | Pairwise probability-theoretic similarity between token pairs: expected probability $E[p_{t_2} \mid t_1]$, expected surprisal $-E[\log p_{t_2} \mid t_1]$, and KL divergence $D_{KL}(g(\cdot\mid t_1)\Vert g(\cdot\mid t_2))$. All quantities are importance-weighted expectations; two entry points cover stored samples (either format) and a streaming corpus pass with either averaging geometry. |
 | [`distinctiveness.py`](shape/distinctiveness.py) | Measures the distinctiveness of tokens in the embedding space. |
 | [`polysemy.py`](shape/polysemy.py) | Analyzes the polysemy of tokens in the embedding space using mixture models. |
 
 ### Working with Cached Features
 
 `shape.extract.valid_positions(meta)` maps memmap rows to corpus
-indices. `shape.viz` builds a working subsample with cached `log_Z_of_h`
-so that $p_w(h_i)$ is an O(d) query per token, which is what makes
-interactive polysemy plotting tractable.
+indices. `viz`, `density` and `polysemy` work in hidden-state space and
+therefore need `{name}_h.npy` samples (no window or
+`averaging='aitchison'`). `shape.viz` builds a working subsample with
+cached `log_Z_of_h` so that $p_w(h_i)$ is an O(d) query per token, which
+is what makes interactive polysemy plotting tractable.
 
 # References
 
 <div id="refs" class="references csl-bib-body hanging-indent"
-entry-spacing="0" line-spacing="2">
+data-entry-spacing="0" data-line-spacing="2">
 
 <div id="ref-karpathy2025" class="csl-entry">
 

@@ -1,17 +1,18 @@
 """
-Stage 2 CLI: fit a normalizing flow on h_eff → flow .pt file.
+Stage 2 CLI: fit a normalizing flow on sampled hidden states → flow .pt file.
 
-Wraps shape.density.fit_flow. Takes the h_eff memmap written by Stage 1 and
+Wraps shape.density.fit_flow. Takes the {dataset}_h.npy memmap written by
+Stage 1 (no window or --averaging aitchison) and
 trains a Neural Spline Flow (Zuko NSF), saving the result to models/.
 
 Example (COCA test, defaults):
     python scripts/fit_density.py \\
-        --h-eff features/coca/coca_test_h_eff.npy \\
+        --h features/coca/coca_test_h.npy \\
         --out models/coca/coca_test_flow.pt
 
 Example (higher capacity, more epochs):
     python scripts/fit_density.py \\
-        --h-eff features/coca/coca_test_w5_harm_h_eff.npy \\
+        --h features/coca/coca_test_w5_harm_h.npy \\
         --out models/coca/coca_test_w5_harm_flow.pt \\
         --transforms 10 --hidden 512 512 512 --bins 10 --epochs 10
 """
@@ -29,11 +30,11 @@ from shape.density import fit_flow
 
 
 def parse_args():
-    p = argparse.ArgumentParser(description="Stage 2: fit NSF density on h_eff.")
+    p = argparse.ArgumentParser(description="Stage 2: fit NSF density on sampled hidden states.")
 
     # Required
-    p.add_argument("--h-eff", required=True,
-                   help="Path to h_eff .npy memmap (N, d) from Stage 1.")
+    p.add_argument("--h", required=True,
+                   help="Path to a hidden-state .npy memmap (N, d) from Stage 1.")
     p.add_argument("--out", required=True,
                    help="Output path for the flow .pt file.")
 
@@ -76,7 +77,7 @@ def main():
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
 
     fit_flow(
-        args.h_eff,
+        args.h,
         out_path=args.out,
         transforms=args.transforms,
         hidden_features=tuple(args.hidden),

@@ -94,11 +94,11 @@ def test_extract_end_to_end_window_zero():
         # Expected n_valid = T - min_context
         assert n_valid == T - 4, f"n_valid = {n_valid}"
 
-        # h_eff memmap check
-        h_eff = np.load(os.path.join(td, 'toy_h_eff.npy'), mmap_mode='r')
-        assert h_eff.shape == (n_valid, d)
+        # h memmap check
+        h = np.load(os.path.join(td, 'toy_h.npy'), mmap_mode='r')
+        assert h.shape == (n_valid, d)
         # No NaN/Inf
-        assert np.isfinite(h_eff).all()
+        assert np.isfinite(h).all()
 
         # Meta file
         with open(os.path.join(td, 'toy_meta.json')) as f:
@@ -109,7 +109,7 @@ def test_extract_end_to_end_window_zero():
 
 
 def test_extract_projection_removes_degenerate_direction():
-    """When project_degenerate=True, h_eff has zero component along v_degen."""
+    """When project_degenerate=True, h has zero component along v_degen."""
     V, d, L = 16, 8, 32
     T = 200
     model = make_toy_model(V=V, d=d, L=L, seed=1)
@@ -124,14 +124,14 @@ def test_extract_projection_removes_degenerate_direction():
             device='cpu', compute_dtype='float32', verbose=False,
         )
         v_degen = np.load(os.path.join(td, 'toy_v_degen.npy'))
-        h_eff = np.load(os.path.join(td, 'toy_h_eff.npy'), mmap_mode='r')
+        h = np.load(os.path.join(td, 'toy_h.npy'), mmap_mode='r')
         # Every row should have ~zero dot product with v_degen
-        dots = h_eff @ v_degen
-        assert np.abs(dots).max() < 1e-4, f"max |h_eff · v_degen| = {np.abs(dots).max():.2e}"
+        dots = h @ v_degen
+        assert np.abs(dots).max() < 1e-4, f"max |h · v_degen| = {np.abs(dots).max():.2e}"
 
 
 def test_extract_window_averaging_reduces_to_single_position_at_zero():
-    """With window=0, h_eff[i] should equal h_t at global position (min_context + i)
+    """With window=0, h[i] should equal h_t at global position (min_context + i)
     when project_degenerate=False."""
     V, d, L = 16, 8, 32
     T = 100
@@ -146,7 +146,7 @@ def test_extract_window_averaging_reduces_to_single_position_at_zero():
             project_degenerate=False, batch_size=2,
             device='cpu', compute_dtype='float32', verbose=False,
         )
-        h_eff = np.load(os.path.join(td, 'toy_h_eff.npy'), mmap_mode='r')
+        h = np.load(os.path.join(td, 'toy_h.npy'), mmap_mode='r')
 
         # Recompute h at global position 4 (first valid) directly
         # First chunk covers [0, L); valid local start = 4; global = 4.
@@ -154,13 +154,13 @@ def test_extract_window_averaging_reduces_to_single_position_at_zero():
         context = torch.from_numpy(data[:L].astype(np.int64)).unsqueeze(0)
         _, _, h_direct = model(context, return_hidden=True)
         h0 = h_direct[0, 4, :].detach().numpy()
-        assert np.allclose(h_eff[0], h0, atol=1e-5), \
-            f"h_eff[0] mismatch: max abs diff {np.abs(h_eff[0] - h0).max():.2e}"
+        assert np.allclose(h[0], h0, atol=1e-5), \
+            f"h[0] mismatch: max abs diff {np.abs(h[0] - h0).max():.2e}"
 
 
 def test_extract_window_averaging_nonzero():
     """Window averaging with window=2, symmetric, include_target, no decay (uniform):
-    h_eff[i] should equal arithmetic mean of h at 5 neighboring positions."""
+    h[i] should equal arithmetic mean of h at 5 neighboring positions."""
     V, d, L = 16, 8, 32
     T = 100
     model = make_toy_model(V=V, d=d, L=L, seed=3)
@@ -175,20 +175,20 @@ def test_extract_window_averaging_nonzero():
             project_degenerate=False, batch_size=4,
             device='cpu', compute_dtype='float32', verbose=False,
         )
-        h_eff = np.load(os.path.join(td, 'toy_h_eff.npy'), mmap_mode='r')
+        h = np.load(os.path.join(td, 'toy_h.npy'), mmap_mode='r')
 
         # First valid position is local 4 (min_context) in chunk 0.
         # With window=2, offsets are {-2,-1,0,1,2} with weight=1 each, total_weight=5.
-        # h_eff[0] = mean(h[2..6])
+        # h[0] = mean(h[2..6])
         context = torch.from_numpy(data[:L].astype(np.int64)).unsqueeze(0)
         _, _, h_direct = model(context, return_hidden=True)
         expected = h_direct[0, 2:7, :].mean(dim=0).detach().numpy()
-        assert np.allclose(h_eff[0], expected, atol=1e-5), \
-            f"max diff {np.abs(h_eff[0] - expected).max():.2e}"
+        assert np.allclose(h[0], expected, atol=1e-5), \
+            f"max diff {np.abs(h[0] - expected).max():.2e}"
 
 
-def test_extract_save_h_eff_false_requires_subsample():
-    """save_h_eff=False without save_subsample should raise."""
+def test_extract_save_states_false_requires_subsample():
+    """save_states=False without save_subsample should raise."""
     V, d, L = 16, 8, 32
     T = 100
     model = make_toy_model(V=V, d=d, L=L)
@@ -201,16 +201,16 @@ def test_extract_save_h_eff_false_requires_subsample():
                 block_size=L, window=0, min_context=4,
                 project_degenerate=False, batch_size=4,
                 device='cpu', compute_dtype='float32',
-                save_h_eff=False, save_subsample=0, verbose=False,
+                save_states=False, save_subsample=0, verbose=False,
             )
         except ValueError as e:
             assert 'save_subsample' in str(e)
             return
-        raise AssertionError("Expected ValueError for save_h_eff=False + save_subsample=0")
+        raise AssertionError("Expected ValueError for save_states=False + save_subsample=0")
 
 
-def test_extract_save_h_eff_false_with_subsample():
-    """save_h_eff=False + save_subsample>0 writes subsample only; no full h_eff."""
+def test_extract_save_states_false_with_subsample():
+    """save_states=False + save_subsample>0 writes subsample only; no full h."""
     V, d, L = 16, 8, 32
     T = 200
     model = make_toy_model(V=V, d=d, L=L, seed=4)
@@ -222,10 +222,10 @@ def test_extract_save_h_eff_false_with_subsample():
             block_size=L, window=0, min_context=4,
             project_degenerate=False, batch_size=4,
             device='cpu', compute_dtype='float32',
-            save_h_eff=False, save_subsample=50, verbose=False,
+            save_states=False, save_subsample=50, verbose=False,
         )
-        # No full h_eff file
-        assert not os.path.exists(os.path.join(td, 'toy_h_eff.npy'))
+        # No full h file
+        assert not os.path.exists(os.path.join(td, 'toy_h.npy'))
         # Subsample file exists at requested size (T - min_context = 196 > 50)
         sub = np.load(os.path.join(td, 'toy_subsample.npy'), mmap_mode='r')
         assert sub.shape == (50, d)
@@ -247,7 +247,7 @@ def test_extract_subsample_truncates_when_undersampled():
             block_size=L, window=0, min_context=4,
             project_degenerate=False, batch_size=4,
             device='cpu', compute_dtype='float32',
-            save_h_eff=False, save_subsample=1000, verbose=False,
+            save_states=False, save_subsample=1000, verbose=False,
         )
         sub = np.load(os.path.join(td, 'toy_subsample.npy'), mmap_mode='r')
         assert sub.shape == (T - 4, d), f"expected {T - 4} rows, got {sub.shape[0]}"

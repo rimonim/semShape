@@ -6,25 +6,25 @@ computes the requested similarity quantities, and writes the results as
 additional columns in the output CSV.  Both plain .csv and gzip-compressed
 .csv.gz files are accepted as input and output (inferred from filename).
 
-Three modes (mutually exclusive):
-  --probs   Precomputed (N, V) probability memmap from sample_gsm.py.
-            No model needed; fastest for repeated analyses.
-  --h-eff   Precomputed h_eff hidden states (no windowing).
-  --data    Stream the corpus with probability-space window averaging.
+Two modes (mutually exclusive):
+  --samples Stored samples from extract_features: {name}_h.npy hidden states
+            (requires --ckpt) or {name}_probs.npy probability vectors.
+            Fastest for repeated analyses.
+  --data    Stream the corpus with window averaging (requires --ckpt).
 
 Examples:
 
-  # From precomputed GSM samples (fastest; run sample_gsm.py first)
+  # From stored probability samples (no model needed)
   python scripts/compute_similarity.py \\
       --input pairs.csv --output pairs_sim.csv \\
       --vocab data/coca/meta.pkl \\
-      --probs features/coca_gsm/coca_val_no_window_probs.npy
+      --samples features/coca_gsm/coca_val_short_forward_probs.npy
 
-  # From h_eff (non-windowed, no corpus re-run)
+  # From stored hidden states
   python scripts/compute_similarity.py \\
       --input pairs.csv --output pairs_sim.csv \\
       --ckpt out-coca/ckpt.pt --vocab data/coca/meta.pkl \\
-      --h-eff features/coca/coca_val_h_eff.npy
+      --samples features/coca_gsm/coca_val_no_window_h.npy
 
   # Streaming windowed corpus pass
   python scripts/compute_similarity.py \\
@@ -32,7 +32,7 @@ Examples:
       --ckpt out-coca/ckpt.pt --vocab data/coca/meta.pkl \\
       --data data/coca/val.bin \\
       --window-size 100 --decay-type power --alpha 0.5 \\
-      --direction backward --tokens-per-minute 150
+      --direction backward --tokens-per-minute 150 --averaging probability
 """
 
 import argparse
@@ -49,10 +49,10 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, PROJECT_ROOT)
 
 from model import GPT, GPTConfig
+from shape.samples import open_samples
 from shape.similarity import (
     compute_pairwise_similarities,
-    compute_pairwise_similarities_from_probs,
-    compute_pairwise_similarities_prob_window,
+    compute_pairwise_similarities_streaming,
 )
 from shape.windowing import build_weight_lookup
 
@@ -75,18 +75,17 @@ def parse_args():
     p.add_argument("--vocab", required=True,
                    help="Path to meta.pkl containing 'stoi' and 'itos' dicts.")
 
-    # Model checkpoint (required for --h-eff and --data, not for --probs)
+    # Model checkpoint (required for hidden-state samples and --data)
     p.add_argument("--ckpt", default=None,
-                   help="Path to GPT checkpoint .pt (required for --h-eff and --data).")
+                   help="Path to GPT checkpoint .pt (required for hidden-state "
+                        "--samples and for --data).")
 
     # Mode (mutually exclusive)
     mode = p.add_mutually_exclusive_group(required=True)
-    mode.add_argument("--probs",
-                      help="Path to *_probs.npy from sample_gsm.py. No model needed.")
-    mode.add_argument("--h-eff",
-                      help="Path to h_eff .npy file (non-windowed, requires --ckpt).")
+    mode.add_argument("--samples",
+                      help="Path to a *_h.npy or *_probs.npy sample file.")
     mode.add_argument("--data",
-                      help="Path to binary corpus .bin for streaming windowed pass "
+                      help="Path to binary corpus .bin for a streaming windowed pass "
                            "(requires --ckpt).")
 
     # Quantities
@@ -110,13 +109,15 @@ def parse_args():
                    help="Exclude d=0 from the window average.")
     p.set_defaults(include_target=True)
     p.add_argument("--tokens-per-minute", type=float, default=None,
-                   help="Convert token distances to minutes before power decay.")
+                   help="Convert token distances to minutes before applying decay.")
+    p.add_argument("--averaging", default="aitchison", choices=["aitchison", "probability"],
+                   help="Window averaging geometry (--data only, default: aitchison).")
 
     # Compute
     p.add_argument("--device", default=None,
                    help="Device string (default: cuda if available, else cpu).")
     p.add_argument("--batch-size", type=int, default=None,
-                   help="Batch size. Defaults: 4096 (--probs), 2048 (--h-eff), 32 (--data).")
+                   help="Batch size. Defaults: 2048 rows (--samples), 32 sequences (--data).")
     p.add_argument("--block-size", type=int, default=None,
                    help="Override model block_size (--data only).")
     p.add_argument("--min-context", type=int, default=32,
@@ -136,6 +137,22 @@ def load_model(ckpt_path, device):
     model.load_state_dict(state)
     model.eval().to(device)
     return model
+
+
+def load_W(ckpt_path, device):
+    """Read lm_head.weight from a checkpoint without building the model."""
+    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    state = {k.removeprefix("_orig_mod."): v for k, v in ckpt["model"].items()}
+    return state["lm_head.weight"].to(device).float()
+
+
+def check_probs(samples_path):
+    """Guard against reading hidden states as probabilities when --ckpt is missing."""
+    row = np.asarray(open_samples(samples_path)[0], dtype=np.float64)
+    if row.min() < 0 or abs(row.sum() - 1.0) > 1e-2:
+        raise SystemExit(f"{samples_path} does not look like probability vectors "
+                         f"(first row sums to {row.sum():.4g}); hidden-state samples "
+                         f"need --ckpt.")
 
 
 def load_vocab(vocab_path):
@@ -160,8 +177,8 @@ def words_to_ids(words, stoi):
 def main():
     p, args = parse_args()
 
-    if args.probs is None and args.ckpt is None:
-        p.error("--ckpt is required for --h-eff and --data modes.")
+    if args.data is not None and args.ckpt is None:
+        p.error("--ckpt is required for --data mode.")
 
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
     print(f"device: {device}")
@@ -209,24 +226,18 @@ def main():
     if n_unique < n_valid:
         print(f"Deduped: {n_valid:,} valid pairs → {n_unique:,} unique pairs")
 
-    if args.probs is not None:
-        batch_size = args.batch_size or 4096
-        print(f"Mode: probs  |  {args.probs}")
-        result = compute_pairwise_similarities_from_probs(
-            args.probs, t1_unique, t2_unique,
-            quantities=args.quantities,
-            batch_size=batch_size,
-            device=device,
-            verbose=True,
-        )
-
-    elif args.h_eff is not None:
+    if args.samples is not None:
         batch_size = args.batch_size or 2048
-        model = load_model(args.ckpt, device)
-        W = model.lm_head.weight.detach().to(device).float()
-        print(f"Model: V={model.config.vocab_size}, d={model.config.n_embd}")
+        print(f"Mode: samples  |  {args.samples}")
+        if args.ckpt is not None:
+            W = load_W(args.ckpt, device)
+            print(f"Checkpoint: V={W.shape[0]}, d={W.shape[1]}")
+        else:
+            W = None
+            check_probs(args.samples)
         result = compute_pairwise_similarities(
-            args.h_eff, W, t1_unique, t2_unique,
+            args.samples, t1_unique, t2_unique,
+            W=W,
             quantities=args.quantities,
             batch_size=batch_size,
             device=device,
@@ -258,11 +269,13 @@ def main():
         print(f"Window: size={args.window_size}, decay={args.decay_type}, "
               f"alpha={args.alpha}, direction={args.direction}, "
               f"include_target={args.include_target}, "
-              f"tokens_per_minute={args.tokens_per_minute}")
+              f"tokens_per_minute={args.tokens_per_minute}, "
+              f"averaging={args.averaging}")
 
-        result = compute_pairwise_similarities_prob_window(
+        result = compute_pairwise_similarities_streaming(
             model, data, weights_lookup,
             t1_unique, t2_unique,
+            averaging=args.averaging,
             quantities=args.quantities,
             block_size=args.block_size,
             min_context=args.min_context,

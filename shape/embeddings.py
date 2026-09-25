@@ -3,7 +3,7 @@ Stage 3 — expected-value layer: PMI matrix, ILR embeddings, SVD.
 
 Computes static word embeddings from a trained GPT via the continuous pipeline:
 
-    h_eff  →  moment matrix M  →  PMI  →  [ILR]  →  SVD  →  low-dim embedding
+    samples  →  moment matrix M  →  PMI  →  [ILR]  →  SVD  →  low-dim embedding
 
 These are the continuous analogue of the discrete FCM+PMI+SVD pipeline in
 build_fcm.py. At window=0 they should be numerically comparable up to the
@@ -24,8 +24,9 @@ giving the symmetric PMI matrix
     PMI[t, w] = log μ_t^X_w - log Z[w]
                = log M[t, w] - log Z[t] - log Z[w]
 
-The Monte-Carlo estimator uses the empirical h_eff sample (the actual corpus
-positions from Stage 1). This is the natural unbiased estimator and matches
+The Monte-Carlo estimator uses the empirical corpus sample written by
+shape.extract.extract_features — hidden states (pass W) or probability vectors
+(probability-space window averages). This is the natural unbiased estimator and matches
 build_fcm.py's implicit empirical-distribution sampling; we can also pass in
 samples drawn from the Stage-2 flow if desired.
 
@@ -34,61 +35,27 @@ and O(N · V²) flops for the accumulation. For small vocabularies this is
 trivial; for COCA (V ≈ 150k) use `target_tokens=` to compute only a row-subset.
 """
 
-from contextlib import nullcontext
-
 import numpy as np
 import torch
 from tqdm import tqdm
 
 from shape.geometry import compute_A, ilr_apply
+from shape.samples import iter_sample_probs, open_samples, sample_format
 
 
-def _open_h_eff(h_eff):
-    """Accept either a path (→ mmap) or an ndarray; return (array, N, d)."""
-    if isinstance(h_eff, str):
-        arr = np.load(h_eff, mmap_mode='r')
-    else:
-        arr = h_eff
-    assert arr.ndim == 2, f"h_eff must be 2D, got shape {arr.shape}"
+def _open_h(h, W):
+    """Open hidden-state samples; return (array, N, d). Rejects probability samples."""
+    arr = open_samples(h)
+    if sample_format(arr, W) != 'h':
+        raise ValueError(
+            f"This function needs hidden-state samples (N, d={W.shape[1]}), got "
+            f"shape {arr.shape}. Probability-space window averages have no "
+            f"hidden-state representation; use averaging='aitchison' or no window.")
     return arr, arr.shape[0], arr.shape[1]
 
 
-def compute_moment_matrix(
-    h_eff,
-    W,
-    *,
-    target_tokens=None,
-    batch_size=2048,
-    device='cuda',
-    verbose=True,
-):
-    """
-    Accumulate the moment matrix and empirical Z over the h_eff sample.
-
-        M[t, w]  = (1/N) Σ_i p_t(h_i) · p_w(h_i)        where p(h) = softmax(Wh)
-        Z_emp[w] = (1/N) Σ_i p_w(h_i)
-
-    Args:
-        h_eff: path to .npy memmap or (N, d) ndarray of hidden states.
-        W: tensor of shape (V, d) — `model.lm_head.weight`.
-        target_tokens: optional array/list of token ids for which to compute
-            rows of M. If None (default), computes the full V×V matrix. Use
-            this for large V (e.g. COCA): M_sub is (|target_tokens|, V).
-        batch_size: rows of h_eff per device batch.
-        device: torch device for the matmul + softmax.
-
-    Returns:
-        dict with keys:
-          'M'      — (V, V) or (|target_tokens|, V) float64 ndarray
-          'Z_emp'  — (V,) float64 ndarray (full, regardless of target_tokens)
-          'target_tokens' — the array passed in (or None)
-          'N'      — number of rows accumulated
-    """
-    h_arr, N, d = _open_h_eff(h_eff)
-    W_t = W.detach().to(device=device, dtype=torch.float32)
-    V, d_w = W_t.shape
-    assert d == d_w, f"h_eff has d={d}, W has d={d_w}"
-
+def _moment_from_batches(prob_batches, V, target_tokens, device):
+    """Accumulate M and Z_emp over an iterable of (B, V) probability batches."""
     if target_tokens is not None:
         target_tokens = np.asarray(target_tokens, dtype=np.int64)
         assert target_tokens.ndim == 1
@@ -97,25 +64,17 @@ def compute_moment_matrix(
     else:
         tgt_idx = None
         M = torch.zeros((V, V), dtype=torch.float64, device=device)
-
     Z_emp = torch.zeros(V, dtype=torch.float64, device=device)
 
-    n_batches = (N + batch_size - 1) // batch_size
-    pbar = tqdm(range(0, N, batch_size),
-                total=n_batches, desc="moment", disable=not verbose, unit="batch")
-    with torch.no_grad():
-        for s in pbar:
-            e = min(s + batch_size, N)
-            h_np = np.ascontiguousarray(h_arr[s:e]).astype(np.float32, copy=False)
-            h = torch.from_numpy(h_np).to(device=device, non_blocking=True)   # (B, d)
-            logits = h @ W_t.T                                                # (B, V)
-            p = torch.softmax(logits.float(), dim=-1)                         # (B, V) fp32
-            if tgt_idx is not None:
-                p_sub = p.index_select(1, tgt_idx)                            # (B, |T|)
-                M += (p_sub.T @ p).to(torch.float64)
-            else:
-                M += (p.T @ p).to(torch.float64)
-            Z_emp += p.sum(dim=0).to(torch.float64)
+    N = 0
+    for p in prob_batches:                                                    # (B, V) fp32
+        if tgt_idx is not None:
+            p_sub = p.index_select(1, tgt_idx)                                # (B, |T|)
+            M += (p_sub.T @ p).to(torch.float64)
+        else:
+            M += (p.T @ p).to(torch.float64)
+        Z_emp += p.sum(dim=0).to(torch.float64)
+        N += p.shape[0]
 
     M /= float(N)
     Z_emp /= float(N)
@@ -127,11 +86,55 @@ def compute_moment_matrix(
     }
 
 
-def compute_moment_matrix_prob_window(
+def compute_moment_matrix(
+    samples,
+    W=None,
+    *,
+    target_tokens=None,
+    batch_size=2048,
+    device='cuda',
+    verbose=True,
+):
+    """
+    Accumulate the moment matrix and empirical Z over stored corpus samples.
+
+        M[t, w]  = (1/N) Σ_i p_t(Y_i) · p_w(Y_i)
+        Z_emp[w] = (1/N) Σ_i p_w(Y_i)
+
+    where p(Y_i) = softmax(W h_i) for hidden-state samples, or the stored
+    probability vector itself.
+
+    Args:
+        samples: path to .npy memmap or ndarray of (N, d) hidden states or
+            (N, V) probability vectors.
+        W: tensor of shape (V, d) — `model.lm_head.weight`. Required for
+            hidden-state samples.
+        target_tokens: optional array/list of token ids for which to compute
+            rows of M. If None (default), computes the full V×V matrix. Use
+            this for large V (e.g. COCA): M_sub is (|target_tokens|, V).
+        batch_size: sample rows per device batch.
+        device: torch device for the matmul + softmax.
+
+    Returns:
+        dict with keys:
+          'M'      — (V, V) or (|target_tokens|, V) float64 ndarray
+          'Z_emp'  — (V,) float64 ndarray (full, regardless of target_tokens)
+          'target_tokens' — the array passed in (or None)
+          'N'      — number of rows accumulated
+    """
+    arr = open_samples(samples)
+    V = W.shape[0] if sample_format(arr, W) == 'h' else arr.shape[1]
+    batches = iter_sample_probs(arr, W, batch_size=batch_size, device=device,
+                                verbose=verbose, desc="moment")
+    return _moment_from_batches(batches, V, target_tokens, device)
+
+
+def compute_moment_matrix_streaming(
     model,
     data,
     weights_lookup,
     *,
+    averaging='aitchison',
     target_tokens=None,
     block_size=None,
     min_context=32,
@@ -141,166 +144,62 @@ def compute_moment_matrix_prob_window(
     verbose=True,
 ):
     """
-    Streaming corpus pass that accumulates a moment matrix using
-    *probability-space* (simplex) window averaging.
+    Streaming corpus pass that accumulates the moment matrix over
+    window-averaged predictive states, without writing samples to disk.
 
-    For each valid corpus position i:
-        X_bar_i = (Σ_d α_d · X_{i+d}) / (Σ_d α_d)
-    where X_j = softmax(W h_j) is the per-position predictive distribution and
-    α_d = weights_lookup[d]. The moment matrix is then
+    For each valid corpus position i, Y_i is the window-averaged predictive
+    state from shape.extract.iter_window_states, and
 
-        M[t, w] += X_bar_i[t] · X_bar_i[w]
+        M[t, w] += p_t(Y_i) · p_w(Y_i)
 
-    which differs from h-space averaging (Variant H in extract.py) by a
-    Jensen-style gap whenever softmax is non-linear over the windowed h's.
+    With averaging='probability', p(Y_i) = X̄_i = Σ_d α_d X_{i+d} / Σ_d α_d; with
+    'aitchison', p(Y_i) = softmax(W h̄_i). The two differ by a Jensen-style gap
+    whenever softmax is non-linear over the windowed h's.
 
     Args:
         model: GPT in eval mode, on `device`.
         data: np.memmap / np.ndarray of corpus tokens.
         weights_lookup: {offset_d: weight} as built by
             shape.windowing.build_weight_lookup. d=0 included by convention.
+        averaging: 'aitchison' or 'probability'.
         target_tokens: optional row-subset (V,) or (|T|,) selector for M.
         block_size: forward-pass length; defaults to model.config.block_size.
         min_context: discards positions with < this many left-context tokens.
-            Bumped up to max |offset| if smaller.
+            Bumped up to the backward window if smaller.
 
     Returns:
         dict with keys:
           'M'      — (V, V) or (|target_tokens|, V) float64 ndarray
-          'Z_emp'  — (V,) float64 ndarray, mean of X_bar
+          'Z_emp'  — (V,) float64 ndarray, mean sampled distribution
           'target_tokens', 'N', 'meta'
     """
-    from shape.extract import _count_valid, _iter_chunks
+    from shape.extract import _resolve_window, iter_window_states
 
     L = block_size if block_size is not None else model.config.block_size
-    V = model.config.vocab_size
-    T = len(data)
-
-    if not weights_lookup:
-        raise ValueError("weights_lookup is empty")
-    offsets = sorted(weights_lookup.keys())
-    total_weight = float(sum(weights_lookup.values()))
-    if total_weight == 0:
-        raise ValueError("weights sum to zero")
-    # Forward / backward windows are tracked separately: forward_window restricts
-    # the right edge of every chunk (need t+forward_window ≤ L-1), while
-    # backward_window restricts the left edge (need t ≥ backward_window). Treating
-    # max|offset| as both gives an empty valid range whenever the window is
-    # backward- or forward-only at chunk-scale.
-    forward_window  = max(max(offsets),  0)
-    backward_window = max(-min(offsets), 0)
-    if min_context < backward_window:
-        min_context = backward_window
-        if verbose:
-            print(f"Note: min_context bumped to {min_context} (= backward window).")
-    # Per-chunk valid range is [min_context, L - forward_window). Empty unless
-    # min_context < L - forward_window, i.e. backward_window + forward_window < L.
-    if min_context + forward_window >= L:
-        raise ValueError(
-            f"backward_window ({backward_window}) + forward_window "
-            f"({forward_window}) >= block_size ({L}); no chunk can contain "
-            f"a valid position. Reduce window_size or increase block_size."
-        )
-
-    if target_tokens is not None:
-        target_tokens = np.asarray(target_tokens, dtype=np.int64)
-        assert target_tokens.ndim == 1
-        tgt_idx = torch.from_numpy(target_tokens).to(device)
-        M = torch.zeros((target_tokens.shape[0], V), dtype=torch.float64, device=device)
-    else:
-        tgt_idx = None
-        M = torch.zeros((V, V), dtype=torch.float64, device=device)
-    Z_emp = torch.zeros(V, dtype=torch.float64, device=device)
-
-    n_valid_total = _count_valid(T, L, forward_window, min_context)
-    chunks_list = list(_iter_chunks(T, L, forward_window, min_context))
-    n_chunks = len(chunks_list)
-    n_batches = (n_chunks + batch_size - 1) // batch_size
-
-    if verbose:
-        print(f"Corpus length: {T:,} tokens; L={L}, "
-              f"forward_window={forward_window}, backward_window={backward_window}, "
-              f"min_context={min_context}")
-        print(f"Valid positions: {n_valid_total:,}")
-        print(f"Active offsets: {offsets}")
-        print(f"Σ w = {total_weight:.4f}")
-
-    device_type = 'cuda' if 'cuda' in device else 'cpu'
-    ptdtype_map = {'float32': torch.float32, 'bfloat16': torch.bfloat16,
-                   'float16': torch.float16}
-    ptdtype = ptdtype_map[compute_dtype]
-    ctx = nullcontext() if device_type == 'cpu' else \
-        torch.amp.autocast(device_type=device_type, dtype=ptdtype)
-
-    cursor = 0
-    model.eval()
-    with torch.no_grad():
-        with ctx:
-            pbar = tqdm(range(0, n_chunks, batch_size), total=n_batches,
-                        desc="prob-moment", disable=not verbose, unit="batch")
-            for batch_start in pbar:
-                chunks = chunks_list[batch_start:batch_start + batch_size]
-                B = len(chunks)
-                input_np = np.zeros((B, L), dtype=np.int64)
-                for i, (s, _, _) in enumerate(chunks):
-                    input_np[i] = data[s:s + L].astype(np.int64)
-                input_tensor = torch.from_numpy(input_np).to(device)
-                logits, _, _ = model(input_tensor, return_hidden=True)
-                X = torch.softmax(logits.float(), dim=-1)            # (B, L, V) fp32
-
-                b_idx_list, t_local_list = [], []
-                for i, (_, vstart, vend) in enumerate(chunks):
-                    for t_local in range(vstart, vend):
-                        b_idx_list.append(i)
-                        t_local_list.append(t_local)
-                n_valid_batch = len(b_idx_list)
-                if n_valid_batch == 0:
-                    continue
-                b_idx = torch.tensor(b_idx_list, dtype=torch.long, device=device)
-                t_local = torch.tensor(t_local_list, dtype=torch.long, device=device)
-
-                X_bar = torch.zeros(n_valid_batch, V, dtype=torch.float32, device=device)
-                for off in offsets:
-                    w_off = float(weights_lookup[off])
-                    X_at_off = X[b_idx, t_local + off, :]            # (n_valid_batch, V)
-                    X_bar.add_(X_at_off, alpha=w_off)
-                X_bar /= total_weight
-
-                if tgt_idx is not None:
-                    X_sub = X_bar.index_select(1, tgt_idx)           # (n_valid_batch, |T|)
-                    M += (X_sub.T @ X_bar).to(torch.float64)
-                else:
-                    M += (X_bar.T @ X_bar).to(torch.float64)
-                Z_emp += X_bar.sum(dim=0).to(torch.float64)
-                cursor += n_valid_batch
-                if verbose:
-                    pbar.set_postfix({'positions': cursor})
-
-    assert cursor == n_valid_total, f"cursor {cursor} != n_valid_total {n_valid_total}"
-    M /= float(n_valid_total)
-    Z_emp /= float(n_valid_total)
-
-    return {
-        'M': M.cpu().numpy(),
-        'Z_emp': Z_emp.cpu().numpy(),
-        'target_tokens': target_tokens,
-        'N': int(n_valid_total),
-        'meta': {
-            'V': int(V),
-            'L': int(L),
-            'forward_window': int(forward_window),
-            'backward_window': int(backward_window),
-            'min_context': int(min_context),
-            'offsets': offsets,
-            'offset_weights': [float(weights_lookup[o]) for o in offsets],
-            'total_weight': total_weight,
-            'compute_dtype': compute_dtype,
-        },
+    win = _resolve_window(weights_lookup, min_context, L)
+    batches = (probs for _, probs in iter_window_states(
+        model, data, weights_lookup,
+        averaging=averaging, block_size=L, min_context=min_context,
+        batch_size=batch_size, device=device, compute_dtype=compute_dtype,
+        verbose=verbose, desc="moment-stream"))
+    out = _moment_from_batches(batches, model.config.vocab_size, target_tokens, device)
+    out['meta'] = {
+        'V': int(model.config.vocab_size),
+        'L': int(L),
+        'averaging': averaging,
+        'forward_window': int(win['forward_window']),
+        'backward_window': int(win['backward_window']),
+        'min_context': int(win['min_context']),
+        'offsets': win['offsets'],
+        'offset_weights': [float(weights_lookup[o]) for o in win['offsets']],
+        'total_weight': win['total_weight'],
+        'compute_dtype': compute_dtype,
     }
+    return out
 
 
 def aitchison_token_embeddings(
-    h_eff,
+    h,
     W,
     *,
     origin='aitchison',
@@ -322,14 +221,15 @@ def aitchison_token_embeddings(
         origin='ilr'       → e_t = h_bar_t           (ILR_Aitchison)
 
     The embedding is naturally d-dimensional (= model hidden size, typically
-    1024) because h_eff lives in ℝ^d.  No SVD is required.
+    1024) because h lives in ℝ^d.  No SVD is required. Requires hidden-state
+    samples (no window, or averaging='aitchison').
 
     Args:
-        h_eff: path to .npy memmap or (N, d) ndarray of hidden states.
+        h: path to .npy memmap or (N, d) ndarray of hidden states.
         W: tensor of shape (V, d) — `model.lm_head.weight`.
         origin: 'aitchison' or 'ilr'.
         target_tokens: optional row-subset to return.
-        batch_size: rows of h_eff per device batch.
+        batch_size: sample rows per device batch.
 
     Returns:
         dict with keys 'embedding', 'h_bar_t', 'h_bar', 'Z_emp', 'A',
@@ -338,10 +238,9 @@ def aitchison_token_embeddings(
     if origin not in ('aitchison', 'ilr'):
         raise ValueError(f"origin must be 'aitchison' or 'ilr', got {origin!r}")
 
-    h_arr, N, d = _open_h_eff(h_eff)
+    h_arr, N, d = _open_h(h, W)
     W_t = W.detach().to(device=device, dtype=torch.float32)
-    V, d_w = W_t.shape
-    assert d == d_w, f"h_eff has d={d}, W has d={d_w}"
+    V = W_t.shape[0]
 
     h_bar_t_acc = torch.zeros((V, d), dtype=torch.float64, device=device)
     Z_acc = torch.zeros(V, dtype=torch.float64, device=device)
@@ -394,7 +293,7 @@ def aitchison_token_embeddings(
 
 
 def compute_moment_matrix_dt(
-    h_eff,
+    h,
     W,
     Z,
     *,
@@ -416,20 +315,21 @@ def compute_moment_matrix_dt(
     PMI_D[t, w] = log M_D[t,w] − log Z_D[t] − log Z[w]
     where Z[w] is the standard Stage-1 marginal (passed in as `Z`).
 
+    Requires hidden-state samples (no window, or averaging='aitchison').
+
     Args:
-        h_eff: path to .npy memmap or (N, d) ndarray of hidden states.
+        h: path to .npy memmap or (N, d) ndarray of hidden states.
         W: tensor of shape (V, d) — `model.lm_head.weight`.
         Z: (V,) array of marginal token probabilities from Stage 1 (window=0).
         target_tokens: optional row-subset selector for M_D.
-        batch_size: rows of h_eff per device batch.
+        batch_size: sample rows per device batch.
 
     Returns:
         dict with keys 'M', 'Z_D', 'Z_emp', 'target_tokens', 'N'.
     """
-    h_arr, N, d = _open_h_eff(h_eff)
+    h_arr, N, d = _open_h(h, W)
     W_t = W.detach().to(device=device, dtype=torch.float32)
-    V, d_w = W_t.shape
-    assert d == d_w, f"h_eff has d={d}, W has d={d_w}"
+    V = W_t.shape[0]
 
     log_Z = torch.from_numpy(
         np.log(np.maximum(np.asarray(Z, dtype=np.float64), 1e-30)).astype(np.float32)
@@ -486,7 +386,7 @@ def compute_moment_matrix_dt(
 
 
 def aitchison_token_embeddings_dt(
-    h_eff,
+    h,
     W,
     Z,
     *,
@@ -510,6 +410,8 @@ def aitchison_token_embeddings_dt(
         origin='ilr'       → e_t = h_bar_t^D
         origin='aitchison' → e_t = h_bar_t^D − h_bar
 
+    Requires hidden-state samples (no window, or averaging='aitchison').
+
     Args:
         Z: (V,) marginal token probabilities from Stage 1 (window=0).
         origin: 'ilr' or 'aitchison'.
@@ -517,10 +419,9 @@ def aitchison_token_embeddings_dt(
     if origin not in ('aitchison', 'ilr'):
         raise ValueError(f"origin must be 'aitchison' or 'ilr', got {origin!r}")
 
-    h_arr, N, d = _open_h_eff(h_eff)
+    h_arr, N, d = _open_h(h, W)
     W_t = W.detach().to(device=device, dtype=torch.float32)
-    V, d_w = W_t.shape
-    assert d == d_w, f"h_eff has d={d}, W has d={d_w}"
+    V = W_t.shape[0]
 
     log_Z = torch.from_numpy(
         np.log(np.maximum(np.asarray(Z, dtype=np.float64), 1e-30)).astype(np.float32)
@@ -578,8 +479,8 @@ def aitchison_token_embeddings_dt(
 
 
 def pmi_matrix(
-    h_eff,
-    W,
+    samples,
+    W=None,
     *,
     Z=None,
     target_tokens=None,
@@ -594,12 +495,10 @@ def pmi_matrix(
         PMI[t, w] = log M[t, w] − log Z[t] − log Z[w]
 
     Args:
-        h_eff: path or ndarray (see compute_moment_matrix).
-        W: (V, d) tensor.
-        Z: (V,) vector. If None, uses the Z_emp recomputed from h_eff. When
-            h_eff was window-averaged in Stage 1, passing the stage-1 Z
-            (computed from un-averaged h) is the framework-aligned choice,
-            though the two agree at window=0.
+        samples: path or ndarray (see compute_moment_matrix).
+        W: (V, d) tensor. Required for hidden-state samples.
+        Z: (V,) vector. If None, uses the Z_emp recomputed from the samples,
+            which equals the `{name}_Z.npy` written by extract_features.
         target_tokens: row-subset selector (None = full V×V).
         eps: floor for log to avoid −inf on zero entries.
 
@@ -607,7 +506,7 @@ def pmi_matrix(
         dict with keys 'pmi', 'M', 'Z', 'Z_emp', 'target_tokens', 'N'.
     """
     out = compute_moment_matrix(
-        h_eff, W,
+        samples, W,
         target_tokens=target_tokens,
         batch_size=batch_size,
         device=device,
@@ -793,8 +692,8 @@ def svd_embeddings(
 
 
 def compute_embeddings(
-    h_eff,
-    W,
+    samples,
+    W=None,
     *,
     Z=None,
     k=300,
@@ -811,7 +710,9 @@ def compute_embeddings(
     svd_n_iter=4,
 ):
     """
-    End-to-end: h_eff → PMI → [ILR] → SVD → (V, k) embedding.
+    End-to-end: samples → PMI → [ILR] → SVD → (V, k) embedding.
+
+    `samples` and `W` are as in compute_moment_matrix.
 
     Args:
         use_ilr: if True, SVD is taken on Ψ·PMI (meaning-only, the
@@ -822,7 +723,7 @@ def compute_embeddings(
         'ilr_emb' (if use_ilr), 'explained_variance_ratio', 'meta'.
     """
     cp = pmi_matrix(
-        h_eff, W,
+        samples, W,
         Z=Z,
         target_tokens=target_tokens,
         eps=eps,
@@ -862,8 +763,8 @@ def compute_embeddings(
             'use_ilr': bool(use_ilr),
             'center': bool(center),
             'N': cp['N'],
-            'V': int(W.shape[0]),
-            'd': int(W.shape[1]),
+            'V': int(cp['Z_emp'].shape[0]),
+            'd': None if W is None else int(W.shape[1]),
             'target_tokens': None if target_tokens is None else list(map(int, target_tokens)),
         },
     }

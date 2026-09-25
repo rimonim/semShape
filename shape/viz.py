@@ -1,11 +1,11 @@
 """
 Stage 2.5: polysemy visualization.
 
-After Stage 1 writes the h_eff memmap, we materialize a working-size sample
-H ∈ ℝ^{N×d} by uniformly subsampling h_eff rows, and cache it together with:
+After extract_features writes the hidden-state memmap `{name}_h.npy`, we materialize a working-size sample
+H ∈ ℝ^{N×d} by uniformly subsampling h rows, and cache it together with:
   - log_Z_of_h[i] = logsumexp(W h_i)   — per-sample full-vocab log-normalizer,
     so p_t(h_i) = exp(W[t]·h_i − log_Z_of_h[i]) is an O(d) query per token.
-  - row_index ∈ ℝ^{N}                   — the h_eff memmap rows that H holds.
+  - row_index ∈ ℝ^{N}                   — the h memmap rows that H holds.
 
 An uncentered SVD (V_basis, S, projections) is only required by the global
 basis path; it is deferred by default and computed lazily on first use.
@@ -47,10 +47,12 @@ import numpy as np
 import torch
 from tqdm import tqdm
 
+from shape.samples import samples_path
+
 
 @dataclass
 class VizSample:
-    H: np.ndarray                 # (N, d) float32 — h_eff rows in h_eff-space
+    H: np.ndarray                 # (N, d) float32 — sampled hidden states
     log_Z_of_h: np.ndarray        # (N,)   float32 — logsumexp(W h_i)
     V_basis: np.ndarray           # (d, d) float32 — right singular vectors (columns)
     S: np.ndarray                 # (d,)   float32 — singular values of H (uncentered)
@@ -79,7 +81,7 @@ class VizSample:
 class CorpusContext:
     """Bundles the three corpus-access objects used together for example extraction."""
     data: np.ndarray        # (T,) uint16 — corpus token ids
-    h_eff: np.ndarray       # (N_valid, d) float32 — Stage 1 h_eff memmap
+    h: np.ndarray           # (N_valid, d) float32 — hidden-state sample memmap
     extract_meta: dict      # loaded from {dataset}_meta.json
 
 
@@ -127,10 +129,12 @@ def build_viz_sample(
     extra_meta=None,
 ):
     """
-    Build a working-size cache for visualization from the Stage 1 h_eff memmap.
+    Build a working-size cache for visualization from a hidden-state sample memmap.
 
     Uniformly subsamples N rows (without replacement) from
-    `{extract_dir}/{dataset_name}_h_eff.npy` and computes log Z(h_i) for each.
+    `{extract_dir}/{dataset_name}_h.npy` (or the legacy `_h_eff.npy`) and
+    computes log Z(h_i) for each. Requires hidden-state samples, i.e. no
+    window or averaging='aitchison' in extract_features.
     The uncentered SVD is only needed by `basis='global'` and
     `plot_global_density`; it is deferred by default and computed on first
     use (and mutated into the VizSample so subsequent calls hit the cache).
@@ -140,11 +144,11 @@ def build_viz_sample(
     Args:
         extract_dir: directory containing Stage 1 outputs.
         dataset_name: Stage 1 dataset name; files
-            `{dataset_name}_h_eff.npy` and `{dataset_name}_meta.json`
+            `{dataset_name}_h.npy` and `{dataset_name}_meta.json`
             are read from `extract_dir`.
         W: tensor of shape (V, d) — `model.lm_head.weight`.
         out_path: destination .npz path.
-        N: number of h_eff rows to subsample. If None or >= n_valid, uses
+        N: number of h rows to subsample. If None or >= n_valid, uses
             the full memmap (watch RAM: N × d × 4 bytes).
         k_pc: number of principal components to precompute projections for
               (default: min(d, 16)). Only consulted when `compute_svd=True`
@@ -159,14 +163,16 @@ def build_viz_sample(
     Returns:
         VizSample (also written to disk).
     """
-    h_eff_path = os.path.join(extract_dir, f"{dataset_name}_h_eff.npy")
-    h_eff_mm = np.load(h_eff_path, mmap_mode='r')
-    n_valid, d = h_eff_mm.shape
+    h_path = samples_path(extract_dir, dataset_name)
+    h_mm = np.load(h_path, mmap_mode='r')
+    n_valid, d = h_mm.shape
     W_t = W.detach().to(device).float()
     V, d_W = W_t.shape
     if d_W != d:
         raise ValueError(
-            f"W has d={d_W} but h_eff memmap has d={d} — mismatched checkpoints?"
+            f"W has d={d_W} but {h_path} has {d} columns — visualization "
+            f"needs hidden-state samples (no window or averaging='aitchison'), "
+            f"not probability vectors, from the same checkpoint."
         )
 
     if k_pc is None:
@@ -177,16 +183,16 @@ def build_viz_sample(
         N = n_valid
         row_index = np.arange(n_valid, dtype=np.int64)
         if verbose:
-            print(f"Using all {n_valid:,} h_eff rows (d={d}).")
+            print(f"Using all {n_valid:,} h rows (d={d}).")
     else:
         rng = np.random.default_rng(seed)
         row_index = rng.choice(n_valid, size=N, replace=False)
         row_index.sort()                             # memmap-friendly reads
         row_index = row_index.astype(np.int64)
         if verbose:
-            print(f"Subsampling {N:,} of {n_valid:,} h_eff rows (d={d}, seed={seed}).")
+            print(f"Subsampling {N:,} of {n_valid:,} h rows (d={d}, seed={seed}).")
 
-    H = np.asarray(h_eff_mm[row_index], dtype=np.float32)
+    H = np.asarray(h_mm[row_index], dtype=np.float32)
 
     if verbose:
         print(f"Computing log Z(h_i) via batched logsumexp over V={V}...")
@@ -216,7 +222,7 @@ def build_viz_sample(
         'seed': int(seed),
         'extract_dir': os.fspath(extract_dir),
         'dataset_name': str(dataset_name),
-        'source': 'h_eff_memmap',
+        'source': 'h_memmap',
         'svd_computed': bool(compute_svd),
     }
     if extra_meta:
@@ -553,7 +559,7 @@ def sample_token_instances(
     viz_sample,
     extract_meta,
     data,
-    h_eff,
+    h,
     *,
     t=None,
     k=6,
@@ -570,14 +576,14 @@ def sample_token_instances(
 
     Each sampled instance is projected into the cached global PC basis
     (`V_basis[:, :k_pc]`) and returned in wide form with `pc1`…`pc_{k_pc}`
-    columns for inspection. The raw `h_eff` vector is also stored on each row
+    columns for inspection. The raw `h` vector is also stored on each row
     so plot functions can re-project it into any basis at plot time.
 
     Args:
         viz_sample: VizSample — provides `V_basis` and `k_pc`.
         extract_meta: dict from `{name}_meta.json`.
         data: corpus memmap/array (uint16) used in Stage 1.
-        h_eff: `(N_valid, d)` memmap/array written by Stage 1.
+        h: `(N_valid, d)` memmap/array written by Stage 1.
         t: next-token id to filter on, or None for random valid positions.
         k: max number of instances to return.
         context: number of tokens (ending at the target) to decode into label.
@@ -585,7 +591,7 @@ def sample_token_instances(
         rng: numpy `Generator` (default `np.random.default_rng()`).
 
     Returns:
-        pandas.DataFrame with columns {row_index, corpus_pos, label, h_eff,
+        pandas.DataFrame with columns {row_index, corpus_pos, label, h,
         pc1, pc2, ..., pc_{k_pc}} (pc{k} only when SVD is cached).
     """
     _, pd, _ = _require_plotnine()
@@ -593,11 +599,11 @@ def sample_token_instances(
         rng = np.random.default_rng()
     from shape.extract import valid_positions
     positions = valid_positions(extract_meta)
-    if len(positions) != h_eff.shape[0]:
+    if len(positions) != h.shape[0]:
         raise ValueError(
             f"N_valid mismatch: positions={len(positions)} but "
-            f"h_eff has {h_eff.shape[0]} rows — extract_meta may not match "
-            f"the h_eff file."
+            f"h has {h.shape[0]} rows — extract_meta may not match "
+            f"the h file."
         )
 
     if t is None:
@@ -618,7 +624,7 @@ def sample_token_instances(
     k_actual = min(k, len(candidates))
     chosen = np.sort(rng.choice(candidates, size=k_actual, replace=False))
 
-    h_sel = np.asarray(h_eff[chosen], dtype=np.float32)          # (k, d)
+    h_sel = np.asarray(h[chosen], dtype=np.float32)          # (k, d)
     if viz_sample.has_svd:
         V = viz_sample.V_basis[:, :viz_sample.k_pc]
         proj = h_sel @ V
@@ -642,7 +648,7 @@ def sample_token_instances(
             'row_index': int(idx),
             'corpus_pos': int(positions[idx]),
             'label': labels[j],
-            'h_eff': np.asarray(h_sel[j], dtype=np.float32).copy(),
+            'h': np.asarray(h_sel[j], dtype=np.float32).copy(),
         }
         if proj is not None:
             for p in range(viz_sample.k_pc):
@@ -705,23 +711,23 @@ def _find_phrase_instances(phrase, viz_sample, corpus_ctx, stoi, decode, phrase_
 
     if phrase_avg == 1:
         i = matches[0]
-        h = np.asarray(corpus_ctx.h_eff[i], dtype=np.float32)
+        h = np.asarray(corpus_ctx.h[i], dtype=np.float32)
         return pd.DataFrame([{
             'row_index': i,
             'corpus_pos': int(positions[i]),
             'label': phrase,
-            'h_eff': h,
+            'h': h,
         }])
     else:
         selected = matches[:phrase_avg]
-        h_vecs = np.stack([np.asarray(corpus_ctx.h_eff[i], dtype=np.float32)
+        h_vecs = np.stack([np.asarray(corpus_ctx.h[i], dtype=np.float32)
                            for i in selected])
         h = h_vecs.mean(axis=0)
         return pd.DataFrame([{
             'row_index': -1,
             'corpus_pos': -1,
             'label': phrase,
-            'h_eff': h,
+            'h': h,
         }])
 
 
@@ -754,7 +760,7 @@ def _resolve_examples(examples, ids, viz_sample, corpus_context, stoi, decode,
             viz_sample,
             corpus_context.extract_meta,
             corpus_context.data,
-            corpus_context.h_eff,
+            corpus_context.h,
             t=ids[0],
             k=examples,
             decode=decode,
@@ -786,14 +792,14 @@ def _examples_long_df(examples_df, pairs, V_basis=None, center=None,
 
     pairs: list of (xi, yi) tuples indexing into the projection columns.
     Same k instances appear in every pair — only (x, y) differs per facet.
-    Re-projects from the raw h_eff vector when V_basis is supplied.
+    Re-projects from the raw h vector when V_basis is supplied.
     """
     _, pd, _ = _require_plotnine()
-    has_h_eff = 'h_eff' in examples_df.columns
-    use_reproject = has_h_eff and V_basis is not None
+    has_h = 'h' in examples_df.columns
+    use_reproject = has_h and V_basis is not None
     if use_reproject:
         H = np.stack([np.asarray(h, dtype=np.float32)
-                      for h in examples_df['h_eff'].values])
+                      for h in examples_df['h'].values])
         if center is not None:
             H = H - np.asarray(center, dtype=np.float32)[None, :]
         proj = H @ np.asarray(V_basis, dtype=np.float32)          # (k, cols)
@@ -1166,7 +1172,7 @@ def plot_density(viz_sample, W=None, Z=None, tokens=None, *,
                     )
                 ex_df = sample_token_instances(
                     viz_sample, corpus_context.extract_meta,
-                    corpus_context.data, corpus_context.h_eff,
+                    corpus_context.data, corpus_context.h,
                     t=None, k=examples, decode=decode,
                 )
             else:
@@ -1311,7 +1317,7 @@ def plot_distinctiveness(viz_sample, W, Z, token, *,
                            examples_df=ex_long, clip=clip)
 
 
-def _plot_empirical_token_density(viz_sample, W, t, extract_meta, data, h_eff, *,
+def _plot_empirical_token_density(viz_sample, W, t, extract_meta, data, h, *,
                                   pcs=(0, 1, 2, 3),
                                   basis='token',
                                   axes=None,
@@ -1333,11 +1339,11 @@ def _plot_empirical_token_density(viz_sample, W, t, extract_meta, data, h_eff, *
     if rng is None:
         rng = np.random.default_rng()
     positions = valid_positions(extract_meta)
-    if len(positions) != h_eff.shape[0]:
+    if len(positions) != h.shape[0]:
         raise ValueError(
             f"N_valid mismatch: positions={len(positions)} but "
-            f"h_eff has {h_eff.shape[0]} rows — extract_meta may not match "
-            f"the h_eff file."
+            f"h has {h.shape[0]} rows — extract_meta may not match "
+            f"the h file."
         )
 
     target_pos = positions + 1
@@ -1354,7 +1360,7 @@ def _plot_empirical_token_density(viz_sample, W, t, extract_meta, data, h_eff, *
 
     if n_total > max_samples:
         idx = np.sort(rng.choice(idx, size=max_samples, replace=False))
-    H_sub = np.asarray(h_eff[idx], dtype=np.float32)
+    H_sub = np.asarray(h[idx], dtype=np.float32)
 
     label = token_label if token_label is not None else f"id={t}"
     shown = len(idx)

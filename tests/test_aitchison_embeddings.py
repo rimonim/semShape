@@ -18,13 +18,13 @@ def test_origin_difference_is_constant_row():
     rng = np.random.default_rng(0)
     V, d, N = 12, 5, 200
     W = torch.from_numpy(rng.standard_normal((V, d)).astype(np.float64))
-    h_eff = rng.standard_normal((N, d)).astype(np.float32)
+    h = rng.standard_normal((N, d)).astype(np.float32)
 
     out_ait = aitchison_token_embeddings(
-        h_eff, W, origin='aitchison', batch_size=64, device='cpu', verbose=False,
+        h, W, origin='aitchison', batch_size=64, device='cpu', verbose=False,
     )
     out_ilr = aitchison_token_embeddings(
-        h_eff, W, origin='ilr', batch_size=64, device='cpu', verbose=False,
+        h, W, origin='ilr', batch_size=64, device='cpu', verbose=False,
     )
 
     A = out_ait['A']
@@ -59,9 +59,9 @@ def test_aitchison_matches_pmi_perp_at_zero_spread():
 
     # Replicate to N samples (5 per token).
     reps = 5
-    h_eff = np.tile(h_per_token, (reps, 1)).astype(np.float32)
+    h = np.tile(h_per_token, (reps, 1)).astype(np.float32)
     # Sanity: softmax(W h_t) should be ~ one-hot at t.
-    logits = h_eff.astype(np.float64) @ W.T
+    logits = h.astype(np.float64) @ W.T
     p = np.exp(logits - logits.max(axis=1, keepdims=True))
     p = p / p.sum(axis=1, keepdims=True)
     # Each row's argmax should equal t = (i mod V)
@@ -71,7 +71,7 @@ def test_aitchison_matches_pmi_perp_at_zero_spread():
 
     # 1) Aitchison embedding (no SVD, no sample noise — h | t is delta).
     out_ait = aitchison_token_embeddings(
-        h_eff, W_t, origin='aitchison',
+        h, W_t, origin='aitchison',
         batch_size=64, device='cpu', verbose=False,
     )
     aitchison_emb = out_ait['embedding']                  # (V, V-1)
@@ -82,7 +82,7 @@ def test_aitchison_matches_pmi_perp_at_zero_spread():
     #    Subtracting the global Ψ · log E[X] → at zero spread reduces to
     #    Ψ W (h_t − h_bar) = A (h_t − h_bar). Same as our 'aitchison' embedding.
     A = compute_A(W_t)                                    # (V-1, d)
-    h_bar = h_eff.astype(np.float64).mean(axis=0)         # (d,)
+    h_bar = h.astype(np.float64).mean(axis=0)         # (d,)
     expected_emb = (h_per_token - h_bar) @ A.numpy().T    # (V, V-1)
 
     np.testing.assert_allclose(aitchison_emb, expected_emb.astype(np.float32),
@@ -90,7 +90,7 @@ def test_aitchison_matches_pmi_perp_at_zero_spread():
 
     # 3) Cross-check: the existing PMI⊥ pipeline (pmi_matrix → ilr_embeddings)
     #    should land on the same row directions (cosine ≈ 1) at zero spread.
-    cp = pmi_matrix(h_eff, W_t, batch_size=64, device='cpu', verbose=False)
+    cp = pmi_matrix(h, W_t, batch_size=64, device='cpu', verbose=False)
     pmi_perp = ilr_embeddings(cp['pmi'])                  # (V, V-1)
     # Cosine similarity per row.
     a = aitchison_emb / (np.linalg.norm(aitchison_emb, axis=1, keepdims=True) + 1e-12)

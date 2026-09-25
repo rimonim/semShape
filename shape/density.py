@@ -1,11 +1,12 @@
 """
-Stage 2: global density estimation on the effective hidden states h_eff.
+Stage 2: global density estimation on sampled hidden states h.
 
-Fits a normalizing flow (Zuko NSF) on the stream of h_eff vectors written by
-Stage 1, providing `log_density(h)` and `sample(n)` in the original h-space.
+Fits a normalizing flow (Zuko NSF) on the `{name}_h.npy` hidden-state samples
+written by shape.extract.extract_features (no window or averaging='aitchison';
+probability-space samples have no hidden-state representation), providing `log_density(h)` and `sample(n)` in the original h-space.
 
 NSF's spline transformations are defined over [-5, 5], so we standardize
-h_eff to zero mean / unit variance before training. The change of variable
+h to zero mean / unit variance before training. The change of variable
 is absorbed into `log_density` / `sample` by storing (mean, std) alongside
 the flow weights.
 
@@ -32,7 +33,7 @@ def _make_flow(d, transforms, hidden_features, bins):
 
 
 class FlowDensity:
-    """Wraps an NSF trained on standardized h_eff.
+    """Wraps an NSF trained on standardized h.
 
     log_density / sample operate on the original (unstandardized) space by
     applying the linear change of variable x_std = (x - mu) / sigma, whose
@@ -108,7 +109,7 @@ def _compute_standardization(h_mm, sample_n=200_000, seed=0):
 
 
 def fit_flow(
-    h_eff_path,
+    h_path,
     *,
     out_path,
     transforms=8,
@@ -124,15 +125,15 @@ def fit_flow(
     verbose=True,
     extra_meta=None,
 ):
-    """Train an NSF on h_eff memmap; save to out_path. Returns FlowDensity."""
+    """Train an NSF on a hidden-state sample memmap; save to out_path. Returns FlowDensity."""
     torch.manual_seed(seed)
     rng = np.random.default_rng(seed)
 
-    h_mm = np.load(h_eff_path, mmap_mode='r')
-    assert h_mm.ndim == 2, f"Expected 2D h_eff, got {h_mm.shape}"
+    h_mm = np.load(h_path, mmap_mode='r')
+    assert h_mm.ndim == 2, f"Expected 2D hidden states, got {h_mm.shape}"
     N, d = h_mm.shape
     if verbose:
-        print(f"h_eff: {N:,} × {d} from {h_eff_path}")
+        print(f"hidden states: {N:,} × {d} from {h_path}")
 
     mean, std = _compute_standardization(h_mm, seed=seed)
     if verbose:
@@ -223,7 +224,7 @@ def fit_flow(
         'lr': lr,
         'weight_decay': weight_decay,
         'history': history,
-        'h_eff_path': os.path.abspath(h_eff_path),
+        'h_path': os.path.abspath(h_path),
     }
     if extra_meta:
         meta.update(extra_meta)

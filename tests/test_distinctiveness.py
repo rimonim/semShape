@@ -40,7 +40,7 @@ def _make_fake_extract(td, dataset='toy', d=4, n_valid=1200, V=12, seed=0,
         'corpus_length': T, 'block_size': T, 'window': 0,
         'min_context': min_context, 'N_valid': n_valid, 'd': d, 'V': V,
     }
-    np.save(os.path.join(td, f'{dataset}_h_eff.npy'), H)
+    np.save(os.path.join(td, f'{dataset}_h.npy'), H)
     with open(os.path.join(td, f'{dataset}_meta.json'), 'w') as f:
         json.dump(meta, f)
     return H, data, meta

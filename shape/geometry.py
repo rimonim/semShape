@@ -36,7 +36,7 @@ def ilr_apply(v):
     """
     V = v.shape[-1]
     i = torch.arange(1, V, dtype=v.dtype, device=v.device)
-    coef_a = torch.sqrt(1.0 / (i * (i + 1)))  # (V-1,)
+    coef_a = torch.sqrt(1.0 / (i * (i + 1)))   # (V-1,)
     coef_b = torch.sqrt(i / (i + 1))           # (V-1,)
     cumv = torch.cumsum(v, dim=-1)             # (..., V)
     return coef_a * cumv[..., :V - 1] - coef_b * v[..., 1:V]
@@ -47,12 +47,7 @@ def ilr_apply_T(y):
     Apply Ψᵀ to y ∈ ℝ^(V-1) along the last dimension.
 
     Ψᵀ maps ILR coordinates back to CLR coordinates (which sum to zero in ℝ^V).
-    Writing the transpose of the formula above and re-using a suffix-sum:
-
-        (Ψᵀ y)_j = (Σ_{i ≥ j} coef_a_i · y_i) − coef_b_{j-1} · y_{j-1}
-
-    where the second term is present only for j ≥ 2 (1-indexed).
-
+    
     Args:
         y: tensor of shape (..., V-1).
 
@@ -96,7 +91,7 @@ def ilr(p, eps=1e-30):
 
 def ilr_basis_dense(V, dtype=torch.float64, device=None):
     """
-    Build Ψ ∈ ℝ^((V-1)×V) densely. For small V only (testing / small vocabs).
+    Build the Helmert sequential-binary-partition Ψ ∈ ℝ^((V-1)×V) densely. 
     Memory scales as O(V²); do not use for V > a few thousand.
     """
     Psi = torch.zeros(V - 1, V, dtype=dtype, device=device)
@@ -110,12 +105,9 @@ def ilr_basis_dense(V, dtype=torch.float64, device=None):
 
 def compute_A(W):
     """
-    Compute A = Ψ W ∈ ℝ^((V-1)×d) via the cumsum identity.
-
-    For row i (1-indexed i = 1..V-1):
-        A_i = (1/sqrt(i(i+1))) · Σ_{j=1..i} W_j  −  sqrt(i/(i+1)) · W_{i+1}
-
-    Runs in O(V·d) time; avoids materializing Ψ.
+    Given an LLM unembedding matrix W, compute A = Ψ W ∈ ℝ^((V-1)×d).
+    This enables the computation of ILR coordinates directly from final 
+    layer hidden states, bypassing the softmax step.
 
     Args:
         W: tensor of shape (V, d) — the output projection `lm_head.weight`.
@@ -134,10 +126,14 @@ def compute_A(W):
 def degenerate_direction(W):
     """
     Unit direction v ∈ ℝ^d such that Wv is as close to 1 ∈ ℝ^V as possible
-    in the least-squares sense. This is the h-space direction annihilated by
-    the ILR transform: ΨW v = Ψ·(Wv) ∝ Ψ·1 = 0.
+    in the least-squares sense. This is the embedding direction annihilated by
+    the ILR transform, assuming the model is sufficiently trained for the softmax
+    invariance to be reflected in W: ΨW v = Ψ·(Wv) ∝ Ψ·1 = 0.
 
     For full-column-rank W, v = W⁺·1 / ||W⁺·1||.
+
+    Experimental: Wv is only approximately constant in practice, so projecting
+    along v changes softmax(W h). 
 
     Args:
         W: tensor of shape (V, d).
@@ -158,7 +154,8 @@ def degenerate_direction(W):
 
 def project_h(h, v_degen):
     """
-    Remove the component of h along v_degen (a unit vector).
+    Remove the component of hidden state h along v_degen (a unit vector).
+    Experimental; see `degenerate_direction`.
 
     Args:
         h: tensor of shape (..., d).

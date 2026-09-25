@@ -23,10 +23,10 @@ from shape.viz import (
 
 def _make_fake_extract(td, dataset='toy', d=4, n_valid=1200, V=12, seed=0,
                       min_context=4):
-    """Write Stage-1-shaped outputs under `td`: `{dataset}_h_eff.npy` and
+    """Write Stage-1-shaped outputs under `td`: `{dataset}_h.npy` and
     `{dataset}_meta.json`. Returns (H, data, meta).
 
-    Uses a 2-mode gaussian-mixture h_eff so SVD has meaningful structure.
+    Uses a 2-mode gaussian-mixture h so SVD has meaningful structure.
     """
     rng = np.random.default_rng(seed)
     comp = rng.integers(0, 2, size=n_valid)
@@ -48,7 +48,7 @@ def _make_fake_extract(td, dataset='toy', d=4, n_valid=1200, V=12, seed=0,
         'd': d,
         'V': V,
     }
-    np.save(os.path.join(td, f'{dataset}_h_eff.npy'), H)
+    np.save(os.path.join(td, f'{dataset}_h.npy'), H)
     with open(os.path.join(td, f'{dataset}_meta.json'), 'w') as f:
         json.dump(meta, f)
     return H, data, meta
@@ -90,7 +90,7 @@ def test_cache_and_load_roundtrip():
         assert np.array_equal(vs.projections, vs2.projections)
         assert np.array_equal(vs.row_index, vs2.row_index)
         assert vs.meta['N'] == N and vs.meta['d'] == d
-        assert vs.meta['source'] == 'h_eff_memmap'
+        assert vs.meta['source'] == 'h_memmap'
         assert vs.meta['svd_computed'] is True
 
 
@@ -150,7 +150,7 @@ def test_build_rejects_dimension_mismatch():
         except ValueError:
             pass
         else:
-            raise AssertionError("expected ValueError for W/h_eff dim mismatch")
+            raise AssertionError("expected ValueError for W/h dim mismatch")
 
 
 def test_log_Z_matches_direct_softmax():
@@ -446,11 +446,11 @@ def test_sample_token_instances_finds_next_token_positions():
         meta = {'corpus_length': T, 'block_size': T,
                 'window': 0, 'min_context': min_ctx}
         N_valid = T - min_ctx
-        h_eff = rng_data.standard_normal((N_valid, d)).astype(np.float32)
+        h = rng_data.standard_normal((N_valid, d)).astype(np.float32)
 
         t_target = 3
         df = sample_token_instances(
-            vs, meta, data, h_eff,
+            vs, meta, data, h,
             t=t_target, k=5, context=6,
             decode=lambda ids: ','.join(str(int(i)) for i in ids),
             rng=np.random.default_rng(1),
@@ -472,7 +472,7 @@ def test_sample_token_instances_finds_next_token_positions():
 
         V_basis = vs.V_basis[:, :vs.k_pc]
         for _, row in df.iterrows():
-            expected = float(h_eff[int(row['row_index'])] @ V_basis[:, 0])
+            expected = float(h[int(row['row_index'])] @ V_basis[:, 0])
             np.testing.assert_allclose(row['pc1'], expected, atol=1e-5)
 
 
@@ -493,10 +493,10 @@ def test_sample_token_instances_random_when_w_is_none():
         min_ctx = 4
         meta = {'corpus_length': T, 'block_size': T,
                 'window': 0, 'min_context': min_ctx}
-        h_eff = np.zeros((T - min_ctx, d), dtype=np.float32)
+        h = np.zeros((T - min_ctx, d), dtype=np.float32)
 
         df = sample_token_instances(
-            vs, meta, data, h_eff,
+            vs, meta, data, h,
             t=None, k=4, context=3,
             rng=np.random.default_rng(7),
         )
@@ -505,7 +505,7 @@ def test_sample_token_instances_random_when_w_is_none():
         assert (df['corpus_pos'] < T).all()
 
 
-def test_sample_token_instances_rejects_mismatched_h_eff():
+def test_sample_token_instances_rejects_mismatched_h():
     d = 4
     V = 6
     with tempfile.TemporaryDirectory() as td:
@@ -520,9 +520,9 @@ def test_sample_token_instances_rejects_mismatched_h_eff():
         meta = {'corpus_length': T, 'block_size': T,
                 'window': 0, 'min_context': 4}
         data = np.zeros(T, dtype=np.uint16)
-        h_eff_wrong = np.zeros((T, d), dtype=np.float32)   # should be T-4
+        h_wrong = np.zeros((T, d), dtype=np.float32)   # should be T-4
         try:
-            sample_token_instances(vs, meta, data, h_eff_wrong,
+            sample_token_instances(vs, meta, data, h_wrong,
                                    t=None, k=2)
         except ValueError:
             pass
@@ -563,10 +563,10 @@ def test_plot_functions_accept_examples_overlay():
         data = np.random.default_rng(0).integers(0, V, size=T, dtype=np.int64).astype(np.uint16)
         meta = {'corpus_length': T, 'block_size': T,
                 'window': 0, 'min_context': 4}
-        h_eff = np.random.default_rng(0).standard_normal((T - 4, d)).astype(np.float32)
+        h = np.random.default_rng(0).standard_normal((T - 4, d)).astype(np.float32)
 
         pcs = [0, 1]
-        ex = sample_token_instances(vs, meta, data, h_eff,
+        ex = sample_token_instances(vs, meta, data, h,
                                     t=None, k=3, context=4,
                                     rng=np.random.default_rng(0))
 
@@ -605,7 +605,7 @@ def test_plot_density_int_examples():
         # Pick a token that appears as next-token in the corpus
         next_tok = data[meta['min_context'] + 1:]
         t_present = int(np.bincount(next_tok.astype(np.int64), minlength=V).argmax())
-        cc = CorpusContext(data=data, h_eff=H, extract_meta=meta)
+        cc = CorpusContext(data=data, h=H, extract_meta=meta)
 
         p = plot_density(vs, W, Z, t_present, pcs=[0, 1],
                          examples=3, corpus_context=cc, n_grid=20)

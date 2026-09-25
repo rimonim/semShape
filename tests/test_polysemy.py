@@ -38,7 +38,7 @@ def _two_mode_h(n_per, d, mu1, mu2, sigma=0.4, seed=0):
 def _build_synth_extract(td, *, dataset='toy', d=6, V=10, n_per=900,
                          mu1=None, mu2=None, sigma=0.4, seed=0,
                          min_context=4):
-    """Write a fake extract dir with a 2-mode h_eff so build_viz_sample loads."""
+    """Write a fake extract dir with a 2-mode h so build_viz_sample loads."""
     if mu1 is None:
         mu1 = np.full(d, 1.5, dtype=np.float32)
     if mu2 is None:
@@ -52,7 +52,7 @@ def _build_synth_extract(td, *, dataset='toy', d=6, V=10, n_per=900,
         'corpus_length': T, 'block_size': T, 'window': 0,
         'min_context': min_context, 'N_valid': n_valid, 'd': d, 'V': V,
     }
-    np.save(os.path.join(td, f'{dataset}_h_eff.npy'), H)
+    np.save(os.path.join(td, f'{dataset}_h.npy'), H)
     with open(os.path.join(td, f'{dataset}_meta.json'), 'w') as f:
         json.dump(meta, f)
     return H, data, meta
@@ -312,14 +312,14 @@ def test_sense_examples_returns_expected_shape_and_ranking():
             'sense_id', 'rank', 'score', 'corpus_pos',
             'context_before', 'focus', 'context_after',
         }
-        # Each sense's top examples should have h_eff vectors closer to its
+        # Each sense's top examples should have h vectors closer to its
         # own centroid than to the other sense's centroid.
         H_to_corpus = np.asarray(meta['N_valid'])  # noqa: not used; clarity
         for k in range(2):
             sub = df[df['sense_id'] == k]
-            # Find each row's h_eff via corpus_pos → row in original H
+            # Find each row's h via corpus_pos → row in original H
             # (since we built data with min_context=4 and N_valid corresponds
-            # to positions [4, 4+N_valid), the h_eff row index = pos - 4)
+            # to positions [4, 4+N_valid), the h row index = pos - 4)
             row_ids = (sub['corpus_pos'].values - meta['min_context']).astype(int)
             chosen_h = vs.H[vs.row_index.searchsorted(row_ids)] \
                 if vs.row_index.size > 0 else H[row_ids]

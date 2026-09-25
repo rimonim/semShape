@@ -12,7 +12,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from shape.density import FlowDensity, fit_flow, load_flow
 
 
-def _make_toy_h_eff(N, d, seed=0, path=None):
+def _make_toy_h(N, d, seed=0, path=None):
     """Mixture of 2 gaussians in R^d, saved as .npy."""
     rng = np.random.default_rng(seed)
     comp = rng.integers(0, 2, size=N)
@@ -33,7 +33,7 @@ def test_fit_flow_roundtrip_and_samples_finite():
     N = 2000
     with tempfile.TemporaryDirectory() as td:
         h_path = os.path.join(td, 'h.npy')
-        X = _make_toy_h_eff(N, d, seed=0, path=h_path)
+        X = _make_toy_h(N, d, seed=0, path=h_path)
 
         flow_path = os.path.join(td, 'flow.pt')
         fd = fit_flow(
@@ -75,7 +75,7 @@ def test_flow_log_density_higher_on_modes_than_between():
     N = 4000
     with tempfile.TemporaryDirectory() as td:
         h_path = os.path.join(td, 'h.npy')
-        _make_toy_h_eff(N, d, seed=1, path=h_path)
+        _make_toy_h(N, d, seed=1, path=h_path)
 
         flow_path = os.path.join(td, 'flow.pt')
         fd = fit_flow(
@@ -112,7 +112,7 @@ def test_flow_change_of_variable_is_consistent():
     N = 1000
     with tempfile.TemporaryDirectory() as td:
         h_path = os.path.join(td, 'h.npy')
-        X = _make_toy_h_eff(N, d, seed=2, path=h_path)
+        X = _make_toy_h(N, d, seed=2, path=h_path)
 
         flow_path = os.path.join(td, 'flow.pt')
         fd = fit_flow(

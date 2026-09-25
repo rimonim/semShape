@@ -5,10 +5,11 @@ from shape.distinctiveness import (
     expected_distinctiveness,
     expected_distinctiveness_all,
 )
+from shape.extract import extract_features, iter_window_states
 from shape.similarity import (
     compute_pairwise_similarities,
-    compute_pairwise_similarities_prob_window,
-    compute_pairwise_similarities_from_probs,
+    compute_pairwise_similarities_streaming,
+    compute_token_marginals,
 )
 
 __all__ = [
@@ -16,6 +17,8 @@ __all__ = [
     'expected_distinctiveness',
     'expected_distinctiveness_all',
     'compute_pairwise_similarities',
-    'compute_pairwise_similarities_prob_window',
-    'compute_pairwise_similarities_from_probs',
+    'compute_pairwise_similarities_streaming',
+    'compute_token_marginals',
+    'extract_features',
+    'iter_window_states',
 ]

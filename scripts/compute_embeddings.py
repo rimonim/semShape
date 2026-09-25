@@ -1,8 +1,9 @@
 """
-Stage 3 CLI: h_eff → PMI → [ILR] → SVD → static word embeddings.
+Stage 3 CLI: samples → PMI → [ILR] → SVD → static word embeddings.
 
-Wraps shape.embeddings.compute_embeddings. Loads W from a checkpoint and h_eff
-+ Z from a Stage-1 features directory; writes the low-dim embedding and the
+Wraps shape.embeddings.compute_embeddings. Loads W from a checkpoint and the
+samples ({dataset}_h.npy or {dataset}_probs.npy) + Z from a Stage-1 features
+directory; writes the low-dim embedding and the
 full PMI matrix to disk.
 
 Example (shakespeare_char, defaults):
@@ -36,6 +37,7 @@ sys.path.insert(0, PROJECT_ROOT)
 
 from model import GPT, GPTConfig
 from shape.embeddings import compute_embeddings, nearest_neighbors
+from shape.samples import samples_path
 
 
 def parse_args():
@@ -45,7 +47,7 @@ def parse_args():
     # Inputs
     p.add_argument("--ckpt", required=True, help="Path to GPT checkpoint .pt.")
     p.add_argument("--features-dir", required=True,
-                   help="Directory containing {dataset}_h_eff.npy, _Z.npy, _meta.json.")
+                   help="Directory containing {dataset}_{h|probs}.npy, _Z.npy, _meta.json.")
     p.add_argument("--dataset", required=True,
                    help="Dataset name prefix (matches Stage 1 output).")
     p.add_argument("--out", required=True,
@@ -67,21 +69,22 @@ def parse_args():
     # Row subsetting for large V
     p.add_argument("--top-tokens", type=int, default=0,
                    help="Restrict PMI rows to top-N most frequent tokens (0 = all V). "
-                        "Uses the Z_emp from h_eff as a proxy for frequency. "
+                        "Uses the Stage 1 Z as a proxy for frequency. "
                         "Forces --no-ilr because Ψ needs full-V rows.")
     p.add_argument("--target-tokens-file", default=None,
                    help="Path to .npy with explicit token-id vector for row subsetting.")
 
     # Compute
     p.add_argument("--batch-size", type=int, default=2048,
-                   help="h_eff rows per device batch (default: 2048).")
+                   help="Sample rows per device batch (default: 2048).")
     p.add_argument("--device", default=None,
                    help="Device string (default: cuda if available, else cpu).")
 
     # Z source
     p.add_argument("--z-from", choices=["stage1", "empirical"], default="stage1",
-                   help="'stage1' uses the saved {dataset}_Z.npy (un-averaged h; "
-                        "framework-aligned). 'empirical' uses Z recomputed from h_eff.")
+                   help="'stage1' uses the saved {dataset}_Z.npy. 'empirical' recomputes "
+                        "Z from the samples (identical for current extract_features "
+                        "outputs; differs for legacy windowed runs).")
 
     # Sanity
     p.add_argument("--neighbors-for", default="",
@@ -113,10 +116,10 @@ def main():
     # Paths
     fdir = args.features_dir
     ds = args.dataset
-    h_eff_path = os.path.join(fdir, f"{ds}_h_eff.npy")
+    sample_file = samples_path(fdir, ds)
     Z_path = os.path.join(fdir, f"{ds}_Z.npy")
     meta_path = os.path.join(fdir, f"{ds}_meta.json")
-    for pth in (h_eff_path, Z_path, meta_path):
+    for pth in (Z_path, meta_path):
         if not os.path.exists(pth):
             raise FileNotFoundError(pth)
 
@@ -124,16 +127,17 @@ def main():
         stage1_meta = json.load(f)
     print(f"Stage 1 meta: N_valid={stage1_meta['N_valid']:,}, V={stage1_meta['V']}, "
           f"d={stage1_meta['d']}, window={stage1_meta['window']}, "
-          f"project_degenerate={stage1_meta['project_degenerate']}")
+          f"averaging={stage1_meta.get('averaging', 'aitchison')}, "
+          f"project_degenerate={stage1_meta.get('project_degenerate', False)}")
 
     # Z selection
     Z_stage1 = np.load(Z_path)
     if args.z_from == "stage1":
         Z = Z_stage1
-        print(f"Using Z from Stage 1 (un-averaged h). Σ_w Z_w = {Z.sum():.6f}")
+        print(f"Using Z from Stage 1. Σ_w Z_w = {Z.sum():.6f}")
     else:
         Z = None
-        print("Using Z_emp recomputed from h_eff.")
+        print("Using Z_emp recomputed from the samples.")
 
     # Target tokens (row subset)
     target_tokens = None
@@ -162,7 +166,7 @@ def main():
 
     # Compute
     result = compute_embeddings(
-        h_eff_path, W,
+        sample_file, W,
         Z=Z,
         k=args.k,
         eig_weight=args.eig_weight,
@@ -175,7 +179,7 @@ def main():
         verbose=True,
     )
 
-    print(f"\nPMI shape: {result['PMI'].shape}")
+    print(f"\nPMI shape: {result['pmi'].shape}")
     print(f"Embedding shape: {result['embedding'].shape}")
     print(f"Explained variance (first {args.k} SVs): "
           f"{result['explained_variance_ratio']:.4f}")
@@ -185,7 +189,7 @@ def main():
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
     save_kwargs = {
         'embedding': result['embedding'],
-        'PMI': result['PMI'].astype(np.float32),
+        'PMI': result['pmi'].astype(np.float32),
         'Z': result['Z'].astype(np.float32),
         'Z_emp': result['Z_emp'].astype(np.float32),
         'S': result['S'].astype(np.float32),
